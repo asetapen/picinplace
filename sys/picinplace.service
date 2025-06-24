@@ -1,0 +1,37 @@
+# picinplace systemd unit file
+#
+# To install (user):
+# cp picinplace.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+
+# Required environment variables:
+#
+# Usage (user):
+#   To enable (auto-boot), disable, check status, start, or stop:
+# systemctl --user enable picinplace.service
+# systemctl --user disable picinplace.service
+# systemctl --user status picinplace.service
+# systemctl --user start picinplace.service
+# systemctl --user stop picinplace.service
+#   To view logs:
+# journalctl --user -u picinplace.service --output cat -f
+
+[Unit]
+Description=PicInPlace
+After=graphical-session.target
+StartLimitInterval=200
+StartLimitBurst=5
+
+[Service]
+# Type=simple
+Type=idle
+ExecStartPre=/usr/bin/env bash -c 'echo STARTING PICINPLACE'
+ExecStart=/usr/bin/env bash -c 'cd /home/adam/code/picinplace && uv run server.py'
+#ExecReload=/usr/bin/env bash -c 'echo RELOAD'
+ExecStop=/usr/bin/env bash -c 'echo STOP'
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+
