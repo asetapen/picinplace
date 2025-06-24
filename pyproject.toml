@@ -1,0 +1,14 @@
+[project]
+name = "picinplace"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.13",
+    "inky>=2.1.0",
+    "pillow>=11.2.1",
+    "pillow-heif>=0.22.0",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.34.3",
+]

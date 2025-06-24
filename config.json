@@ -1,0 +1,7 @@
+{
+	"max_images": 10, 
+	"cycle_interval": 60,
+	"display_size": [800, 480],
+	"saturation": 0.8
+}
+
