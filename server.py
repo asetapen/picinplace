@@ -109,9 +109,45 @@ def display_image(image_path: Path):
             inky.set_image(image)
         inky.show()
         
+        # Create a mock frame display copy for testing
+        create_mock_frame_display(image_path)
+        
         print(f"Displayed image: {image_path.name}")
     except Exception as e:
         print(f"Error displaying image: {e}")
+
+
+def create_mock_frame_display(image_path: Path):
+    """Create a mock picture frame display for testing purposes."""
+    try:
+        # Create mock frame directory
+        mock_dir = Path("mock_frame")
+        mock_dir.mkdir(exist_ok=True)
+        
+        # Copy the current image to mock frame display
+        image = Image.open(image_path)
+        
+        # Resize to e-ink dimensions if needed
+        if image.size != CONFIG["display_size"]:
+            image = resize_and_crop_image(image, CONFIG["display_size"])
+        
+        # Apply saturation effect to simulate e-ink display
+        if image.mode == 'RGB':
+            # Convert to grayscale for e-ink simulation
+            grayscale = image.convert('L')
+            # Apply slight tint to simulate e-ink colors
+            mock_image = Image.new('RGB', grayscale.size, (250, 245, 230))  # Off-white background
+            mock_image.paste(grayscale, mask=grayscale)
+        else:
+            mock_image = image
+        
+        # Save as current display
+        mock_path = mock_dir / "current_display.jpg"
+        mock_image.save(mock_path, "JPEG", quality=95)
+        
+        print(f"Mock frame updated: {mock_path}")
+    except Exception as e:
+        print(f"Error creating mock frame display: {e}")
 
 
 def cycle_images():
@@ -121,7 +157,9 @@ def cycle_images():
     while cycling_enabled:
         if image_files:
             display_image(image_files[current_image_index])
-            current_image_index = (current_image_index + 1) % len(image_files)
+            # Only advance to next image if we're still cycling
+            if cycling_enabled:
+                current_image_index = (current_image_index + 1) % len(image_files)
         
         time.sleep(CONFIG["cycle_interval"])
 
@@ -291,6 +329,24 @@ async def control_cycling(action: str):
         raise HTTPException(status_code=400, detail="Invalid action")
 
 
+@app.post("/api/display/{index}")
+async def display_image_by_index(index: int):
+    """Display a specific image by index."""
+    global current_image_index
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No images available")
+    
+    if index < 0 or index >= len(image_files):
+        raise HTTPException(status_code=404, detail="Image index out of range")
+    
+    # Update current index and display the image
+    current_image_index = index
+    display_image(image_files[index])
+    
+    return {"message": "Image displayed", "index": index}
+
+
 @app.get("/api/heic-support")
 async def check_heic_support():
     """Check if HEIC support is available."""
@@ -311,6 +367,16 @@ async def get_thumbnail(filename: str):
             if thumb:
                 return FileResponse(thumb)
         raise HTTPException(status_code=404, detail="Thumbnail not found")
+
+
+@app.get("/api/mock-frame")
+async def get_mock_frame():
+    """Get the current mock frame display."""
+    mock_path = Path("mock_frame") / "current_display.jpg"
+    if mock_path.exists():
+        return FileResponse(mock_path)
+    else:
+        raise HTTPException(status_code=404, detail="Mock frame not available")
 
 
 # Serve React frontend
@@ -454,6 +520,40 @@ async def serve_frontend():
             background-color: #ffebee;
             color: #c62828;
         }
+        .mock-frame {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .frame-container {
+            display: inline-block;
+            border: 8px solid #333;
+            border-radius: 12px;
+            background: #f5f5f5;
+            padding: 10px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        .frame-display {
+            max-width: 400px;
+            max-height: 240px;
+            width: auto;
+            height: auto;
+            border-radius: 4px;
+            display: block;
+        }
+        .frame-placeholder {
+            width: 400px;
+            height: 240px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 16px;
+        }
     </style>
 </head>
 <body>
@@ -503,6 +603,7 @@ async def serve_frontend():
             const [status, setStatus] = useState('');
             const [error, setError] = useState('');
             const [heicSupport, setHeicSupport] = useState(false);
+            const [mockFrameKey, setMockFrameKey] = useState(0);
 
             useEffect(() => {
                 fetchImages();
@@ -590,6 +691,8 @@ async def serve_frontend():
                     if (response.ok) {
                         setStatus('Image uploaded successfully!');
                         fetchImages();
+                        // Refresh mock frame display
+                        setMockFrameKey(prev => prev + 1);
                         setTimeout(() => setStatus(''), 3000);
                     } else {
                         const errorData = await response.json();
@@ -603,8 +706,10 @@ async def serve_frontend():
 
             const displayImage = async (index) => {
                 try {
-                    await fetch(`/api/display/${index}`);
+                    await fetch(`/api/display/${index}`, { method: 'POST' });
                     fetchImages();
+                    // Refresh mock frame display
+                    setMockFrameKey(prev => prev + 1);
                 } catch (err) {
                     console.error('Error displaying image:', err);
                 }
@@ -669,6 +774,24 @@ async def serve_frontend():
                             {cycling ? 'Stop Cycling' : 'Start Cycling'}
                         </button>
                         <span>Cycling: {cycling ? 'ON' : 'OFF'}</span>
+                    </div>
+
+                    <div className="mock-frame">
+                        <h3>Current Display (Mock Frame)</h3>
+                        <div className="frame-container">
+                            <img 
+                                src={`/api/mock-frame?v=${mockFrameKey}`}
+                                alt="Current frame display"
+                                className="frame-display"
+                                onError={(e) => {
+                                    e.target.style.display = 'none';
+                                    e.target.nextSibling.style.display = 'block';
+                                }}
+                            />
+                            <div className="frame-placeholder" style={{ display: 'none' }}>
+                                No image displayed
+                            </div>
+                        </div>
                     </div>
 
                     <div className="config">
