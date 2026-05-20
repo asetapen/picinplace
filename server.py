@@ -926,10 +926,17 @@ async def serve_frontend():
         .modal-actions {
             display: flex; gap: 10px; margin-top: 16px; align-items: center;
         }
-        .btn-secondary { background-color: #888; }
-        .btn-secondary:hover { background-color: #666; }
+        .btn-secondary {
+            background-color: white;
+            color: #333;
+            border: 1px solid #ccc;
+        }
+        .btn-secondary:hover { background-color: #f0f0f0; }
         .modal-hint {
             margin: 4px 0 12px; color: #666; font-size: 13px;
+        }
+        .modal-loading {
+            padding: 60px 40px; text-align: center; color: #888;
         }
     </style>
 </head>
@@ -1126,40 +1133,55 @@ async def serve_frontend():
                 boxSizing: 'border-box',
             } : null;
 
+            // Dismiss on actual backdrop press (not on a drag release that
+            // happens to end on the backdrop). Compare target to currentTarget
+            // so only direct presses on the overlay count.
+            const onBackdropDown = (e) => {
+                if (e.target === e.currentTarget) onClose();
+            };
+
+            const loaded = crop && origSize;
+
             return (
-                <div className="modal-overlay" onClick={onClose}>
-                    <div className="modal" onClick={e => e.stopPropagation()}>
+                <div className="modal-overlay" onMouseDown={onBackdropDown}>
+                    <div className="modal" onMouseDown={e => e.stopPropagation()}>
                         <h3>Re-frame {filename}</h3>
                         <p className="modal-hint">
                             Drag inside the rectangle to move it; drag corners to resize.
                             Aspect locked to {dispSize[0]}×{dispSize[1]}.
                         </p>
-                        <div className="crop-stage">
-                            <img ref={imgRef}
-                                 src={`/api/original/${filename}`}
-                                 alt={filename}
-                                 className="crop-image"
-                                 onLoad={measure}
-                                 draggable={false} />
-                            {overlay && (
-                                <div style={overlay} onPointerDown={startDrag('move')}>
-                                    <div className="crop-handle handle-nw" onPointerDown={startDrag('nw')} />
-                                    <div className="crop-handle handle-ne" onPointerDown={startDrag('ne')} />
-                                    <div className="crop-handle handle-sw" onPointerDown={startDrag('sw')} />
-                                    <div className="crop-handle handle-se" onPointerDown={startDrag('se')} />
-                                </div>
-                            )}
-                        </div>
-                        <div className="modal-actions">
-                            <button onClick={autoFrame} disabled={autoframing || !crop}>
-                                {autoframing ? 'Detecting…' : 'Auto-frame faces'}
-                            </button>
-                            <div style={{flex: 1}} />
-                            <button className="btn-secondary" onClick={onClose}>Cancel</button>
-                            <button onClick={save} disabled={saving || !crop}>
-                                {saving ? 'Saving…' : 'Save'}
-                            </button>
-                        </div>
+                        {loaded ? (
+                            <div className="crop-stage">
+                                <img ref={imgRef}
+                                     src={`/api/original/${filename}`}
+                                     alt={filename}
+                                     className="crop-image"
+                                     onLoad={measure}
+                                     draggable={false} />
+                                {overlay && (
+                                    <div style={overlay} onPointerDown={startDrag('move')}>
+                                        <div className="crop-handle handle-nw" onPointerDown={startDrag('nw')} />
+                                        <div className="crop-handle handle-ne" onPointerDown={startDrag('ne')} />
+                                        <div className="crop-handle handle-sw" onPointerDown={startDrag('sw')} />
+                                        <div className="crop-handle handle-se" onPointerDown={startDrag('se')} />
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="modal-loading">Loading original…</div>
+                        )}
+                        {loaded && (
+                            <div className="modal-actions">
+                                <button onClick={autoFrame} disabled={autoframing}>
+                                    {autoframing ? 'Detecting…' : 'Auto-frame faces'}
+                                </button>
+                                <div style={{flex: 1}} />
+                                <button className="btn-secondary" onClick={onClose}>Cancel</button>
+                                <button onClick={save} disabled={saving}>
+                                    {saving ? 'Saving…' : 'Save'}
+                                </button>
+                            </div>
+                        )}
                     </div>
                 </div>
             );
