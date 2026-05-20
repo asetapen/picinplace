@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 from datetime import datetime
@@ -19,7 +20,7 @@ except ImportError:
     HEIC_SUPPORT = False
     print("Warning: HEIC support not available. Install with: pip install pillow-heif")
 
-from inky.auto import auto
+MOCK_DISPLAY = "--mock" in sys.argv or os.environ.get("PICINPLACE_MOCK") == "1"
 
 # Configuration
 CONFIG = {
@@ -51,19 +52,29 @@ image_files: List[Path] = []
 cycling_enabled = True
 cycle_thread = None
 
-# Mock inky module for development (remove this when using real hardware)
+# Mock inky module for development / running without hardware (--mock)
 class MockInky:
     def set_image(self, image, saturation=None):
-        print(f"Setting image with saturation: {saturation}")
+        print(f"[mock display] set_image saturation={saturation} size={image.size}")
+        # Simulate the slow e-ink refresh so timings feel realistic in dev.
+        time.sleep(0.2)
 
     def show(self):
-        print("Displaying image on e-ink display")
+        print("[mock display] show()")
 
-# Initialize inky (use real import when on actual hardware)
-# from inky import InkyPHAT
-# inky = InkyPHAT("black")
-# inky = MockInky()  # Remove this line when using real hardware
-inky = auto(ask_user=True, verbose=True)
+
+def _init_display():
+    if MOCK_DISPLAY:
+        print("Running with --mock: no e-ink hardware will be used.")
+        return MockInky()
+    from inky.auto import auto
+    return auto(ask_user=True, verbose=True)
+
+
+inky = _init_display()
+
+# Serialize display writes so concurrent clicks don't fight for the e-ink bus.
+display_lock = threading.Lock()
 
 def resize_and_crop_image(image: Image.Image, target_size: tuple) -> Image.Image:
     """Resize and crop image to target size maintaining aspect ratio."""
@@ -94,71 +105,82 @@ def resize_and_crop_image(image: Image.Image, target_size: tuple) -> Image.Image
     return image.crop((left, top, right, bottom))
 
 
-def display_image(image_path: Path):
-    """Display image on e-ink display."""
-    try:
-        image = Image.open(image_path)
-        # Convert to RGB if necessary
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Display on e-ink
+def _push_to_eink(image_path: Path):
+    """Slow path: actually drive the e-ink panel. Serialized via display_lock."""
+    with display_lock:
         try:
-            inky.set_image(image, saturation=CONFIG["saturation"])
-        except TypeError:
-            inky.set_image(image)
-        inky.show()
-        
-        # Create a mock frame display copy for testing
-        create_mock_frame_display(image_path)
-        
-        print(f"Displayed image: {image_path.name}")
-    except Exception as e:
-        print(f"Error displaying image: {e}")
+            image = Image.open(image_path)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            try:
+                inky.set_image(image, saturation=CONFIG["saturation"])
+            except TypeError:
+                inky.set_image(image)
+            inky.show()
+            print(f"Pushed to e-ink: {image_path.name}")
+        except Exception as e:
+            print(f"Error pushing to e-ink: {e}")
+
+
+def display_image(image_path: Path):
+    """Full synchronous pipeline: update the web preview and the e-ink panel.
+
+    Used by the cycle thread and startup, where blocking is fine.
+    """
+    create_mock_frame_display(image_path)
+    _push_to_eink(image_path)
+
+
+def display_image_async(image_path: Path):
+    """Used by HTTP handlers: write the web preview synchronously (fast)
+    so the next /api/mock-frame fetch sees the new image, then push to
+    the (slow) e-ink panel from a background thread.
+    """
+    create_mock_frame_display(image_path)
+    threading.Thread(target=_push_to_eink, args=(image_path,), daemon=True).start()
 
 
 def create_mock_frame_display(image_path: Path):
-    """Create a mock picture frame display for testing purposes."""
+    """Write the full-color preview shown in the web UI as 'Mock Frame'.
+
+    Written atomically (temp file + os.replace) so a concurrent GET /api/mock-frame
+    can't observe a half-rewritten file — that races with Starlette's Content-Length
+    and raises h11 "Too much data for declared Content-Length".
+    """
     try:
-        # Create mock frame directory
         mock_dir = Path("mock_frame")
         mock_dir.mkdir(exist_ok=True)
-        
-        # Copy the current image to mock frame display
+
         image = Image.open(image_path)
-        
-        # Resize to e-ink dimensions if needed
         if image.size != CONFIG["display_size"]:
             image = resize_and_crop_image(image, CONFIG["display_size"])
-        
-        # Apply saturation effect to simulate e-ink display
-        from PIL import ImageEnhance
         if image.mode != 'RGB':
             image = image.convert('RGB')
-        enhancer = ImageEnhance.Color(image)
-        mock_image = enhancer.enhance(CONFIG["saturation"])
-        
-        # Save as current display
+
         mock_path = mock_dir / "current_display.jpg"
-        mock_image.save(mock_path, "JPEG", quality=95)
-        
+        tmp_path = mock_dir / "current_display.jpg.tmp"
+        image.save(tmp_path, "JPEG", quality=95)
+        os.replace(tmp_path, mock_path)
+
         print(f"Mock frame updated: {mock_path}")
     except Exception as e:
         print(f"Error creating mock frame display: {e}")
 
 
 def cycle_images():
-    """Background thread to cycle through images."""
+    """Background thread to cycle through images.
+
+    Sleep first, then advance and display, so current_image_index always
+    names what is currently on the panel (matching what load_existing_images
+    already drew at startup, or whatever the user last selected).
+    """
     global current_image_index
-    
+
     while cycling_enabled:
-        if image_files:
-            display_image(image_files[current_image_index])
-            # Only advance to next image if we're still cycling
-            if cycling_enabled:
-                current_image_index = (current_image_index + 1) % len(image_files)
-        
         time.sleep(CONFIG["cycle_interval"])
+        if cycling_enabled and image_files:
+            current_image_index = (current_image_index + 1) % len(image_files)
+            display_image(image_files[current_image_index])
 
 
 def start_cycling():
@@ -255,7 +277,7 @@ async def upload_image(file: UploadFile = File(...)):
         processed_image.save(filepath, "JPEG", quality=95)
         
         # Update image list
-        global image_files
+        global image_files, current_image_index
         image_files.append(filepath)
         
         # Create thumbnail
@@ -270,9 +292,11 @@ async def upload_image(file: UploadFile = File(...)):
             if thumb_path.exists():
                 thumb_path.unlink()
         
-        # Display the new image immediately
-        display_image(filepath)
-        
+        # Make the freshly uploaded image the current one and push to display
+        # in the background so the HTTP response isn't held by the slow e-ink refresh.
+        current_image_index = len(image_files) - 1
+        display_image_async(filepath)
+
         return {"message": "Image uploaded successfully", "filename": filename}
     
     except HTTPException:
@@ -337,10 +361,11 @@ async def display_image_by_index(index: int):
     if index < 0 or index >= len(image_files):
         raise HTTPException(status_code=404, detail="Image index out of range")
     
-    # Update current index and display the image
+    # Update the current index immediately so /api/images reflects the
+    # new selection on the next poll, and push to the e-ink in the background.
     current_image_index = index
-    display_image(image_files[index])
-    
+    display_image_async(image_files[index])
+
     return {"message": "Image displayed", "index": index}
 
 
@@ -672,7 +697,14 @@ async def serve_frontend():
                     const response = await fetch('/api/images');
                     const data = await response.json();
                     setImages(data.images);
-                    setCurrentIndex(data.current_index);
+                    setCurrentIndex(prev => {
+                        // Whenever the displayed image changes (cycle thread
+                        // advance, or anything else), re-fetch the mock preview.
+                        if (prev !== data.current_index) {
+                            setMockFrameKey(k => k + 1);
+                        }
+                        return data.current_index;
+                    });
                 } catch (err) {
                     console.error('Error fetching images:', err);
                 }
@@ -749,11 +781,15 @@ async def serve_frontend():
             };
 
             const displayImage = async (index) => {
+                // Optimistic: mark the clicked thumbnail as current immediately.
+                // The mock preview is rewritten synchronously by the server before
+                // the response returns, so we wait for the POST to land before
+                // bumping mockFrameKey — otherwise we'd re-fetch the stale file.
+                setCurrentIndex(index);
                 try {
                     await fetch(`/api/display/${index}`, { method: 'POST' });
-                    fetchImages();
-                    // Refresh mock frame display
                     setMockFrameKey(prev => prev + 1);
+                    fetchImages();
                 } catch (err) {
                     console.error('Error displaying image:', err);
                 }

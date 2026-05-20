@@ -14,6 +14,9 @@ REPO_ROOT="$( cd -P "$( dirname "$SOURCE" )" >/dev/null && pwd )"
 
 SERVICE_NAME='picinplace'
 
+# Pull in the e-ink driver (inky + spidev + gpiod) — Linux only.
+(cd "${REPO_ROOT}" && uv sync --extra hardware)
+
 mkdir -p "${HOME}/.config/systemd/user"
 cp "${REPO_ROOT}/sys/${SERVICE_NAME}.service" "${HOME}/.config/systemd/user/"
 systemctl --user daemon-reload

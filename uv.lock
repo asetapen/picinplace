@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 
 [[package]]
@@ -190,22 +190,27 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
-    { name = "inky" },
     { name = "pillow" },
     { name = "pillow-heif" },
     { name = "python-multipart" },
     { name = "uvicorn" },
 ]
 
+[package.optional-dependencies]
+hardware = [
+    { name = "inky" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115.13" },
-    { name = "inky", specifier = ">=2.1.0" },
+    { name = "inky", marker = "extra == 'hardware'", specifier = ">=2.1.0" },
     { name = "pillow", specifier = ">=11.2.1" },
     { name = "pillow-heif", specifier = ">=0.22.0" },
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "uvicorn", specifier = ">=0.34.3" },
 ]
+provides-extras = ["hardware"]
 
 [[package]]
 name = "pillow"
