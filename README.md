@@ -1,0 +1,130 @@
+# PicInPlace
+
+A tiny picture-frame app for a Raspberry Pi + [Pimoroni Inky Impression](https://shop.pimoroni.com/products/inky-impression-7-3) (or similar e-ink display). You upload photos via a web UI from any device on the network; the Pi resizes, stores, and cycles through them on the e-ink panel.
+
+Built for a desk picture frame at work. Includes a `--mock` mode so the whole thing runs on a laptop without any hardware.
+
+## What's in the box
+
+- `server.py` — FastAPI app: API, embedded React UI, image processing, e-ink driver glue, cycling thread.
+- `config.json` — runtime config (image count, cycle interval, display size, saturation).
+- `install.sh` / `stop.sh` — install/uninstall the systemd user service on the Pi.
+- `sys/picinplace.service` — the systemd unit.
+- `uploaded_images/` — processed JPEGs + `thumbnails/`.
+- `mock_frame/current_display.jpg` — full-color preview of whatever is currently on the e-ink (shown in the web UI).
+
+## Running
+
+### On a laptop (no hardware required)
+
+```bash
+uv sync
+uv run server.py --mock
+```
+
+Open <http://localhost:8000>. The "Mock Frame" panel in the UI shows what would be on the e-ink, in full color. You can also set `PICINPLACE_MOCK=1` instead of passing the flag.
+
+### On the Raspberry Pi (real e-ink)
+
+The e-ink driver (`inky`) is an optional extra because its `spidev` dependency only builds on Linux.
+
+```bash
+uv sync --extra hardware
+uv run server.py
+```
+
+Then point a browser at `http://<pi-hostname>.local:8000`.
+
+## Web UI
+
+- Drag-and-drop or click to upload an image (JPEG/PNG/GIF/WebP/HEIC).
+- Click any thumbnail to push it to the display. The selection indicator updates instantly; the actual e-ink refresh happens in the background (e-ink panels take 15-30s to redraw).
+- **Reframe** on any thumbnail opens a crop editor: drag the rectangle to reposition, drag a corner to resize (aspect-locked to the display). **Auto-frame faces** runs OpenCV's Haar cascade to suggest a crop centered on detected faces (with a bit of headroom); falls back to a center crop if it finds nothing. **Save** re-cuts the display JPEG and pushes the new framing to the e-ink if the image is currently shown.
+- "Stop/Start Cycling" pauses the auto-rotation.
+- Adjust max image count, cycle interval, and saturation, then "Update Configuration" to persist.
+
+### How framing storage works
+
+- The original (downsized to a max edge of 2000px) is kept under `uploaded_images/originals/`.
+- The 800×480 JPEG you see on the panel is re-derived from the original whenever the crop changes.
+- Crops are stored in `uploaded_images/crops.json` as `{x, y, w, h}` rects in original-pixel coordinates.
+- On upload, OpenCV face detection runs once to pick the initial crop. You can re-run it any time from the Reframe modal.
+- Existing images that pre-date this feature are migrated lazily: their current 800×480 JPEG is copied into `originals/` and used as its own source — re-framing them just repositions a 5:3 window inside the existing crop, since the pre-crop pixels weren't kept. New uploads keep proper originals.
+
+## Configuration (`config.json`)
+
+| Key              | Default       | Meaning                                                          |
+| ---------------- | ------------- | ---------------------------------------------------------------- |
+| `max_images`     | `10`          | Oldest images are deleted past this count.                       |
+| `cycle_interval` | `600`         | Seconds between auto-rotations.                                  |
+| `display_size`   | `[800, 480]`  | Target resolution images are cropped/resized to.                 |
+| `saturation`     | `0.5`         | Passed to the Inky driver. `0` = grayscale, `1` = full color. Only affects the real e-ink — the mock preview is always full color. |
+
+## API quick reference
+
+| Method | Path                       | Purpose                                  |
+| ------ | -------------------------- | ---------------------------------------- |
+| POST   | `/api/upload`              | Upload a file (multipart). Saves original + runs face-detect for initial crop. |
+| GET    | `/api/images`              | List stored images + current index.      |
+| POST   | `/api/display/{index}`     | Show image at index. Returns immediately. |
+| POST   | `/api/cycle/{start\|stop}` | Toggle auto-rotation.                    |
+| GET    | `/api/thumbnail/{name}`    | Get a 150×90 thumbnail.                  |
+| DELETE | `/api/images/{name}`       | Delete an image (display JPEG + thumbnail + original + crop entry). |
+| GET    | `/api/original/{name}`     | Serve the stored original (for the re-frame UI). |
+| GET    | `/api/crop/{name}`         | Return `{crop, original_size, display_size}`. |
+| POST   | `/api/crop/{name}`         | Persist a new crop `{x,y,w,h}` and re-render the display JPEG. |
+| POST   | `/api/autocrop/{name}`     | Suggest a face-detect crop *without* persisting. Client decides whether to POST `/api/crop/`. |
+| GET    | `/api/config`              | Get current config.                      |
+| POST   | `/api/config`              | Patch config (any subset of keys).       |
+| GET    | `/api/mock-frame`          | Full-color preview JPEG.                 |
+| GET    | `/api/heic-support`        | Reports whether HEIC decoding is enabled. |
+
+## Auto-boot on the Pi (systemd user service)
+
+```bash
+./install.sh                                # installs and starts the user service
+systemctl --user status picinplace.service
+journalctl --user -u picinplace.service -f  # tail the logs
+./stop.sh                                   # stop + disable
+```
+
+The unit hardcodes `/home/adam/code/picinplace` — edit `sys/picinplace.service` if your path differs. For the service to survive a Pi reboot without you logging in, enable lingering once:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+## Running the Pi as a Wi-Fi access point
+
+Useful at work where personal devices can't join the corporate network: have the Pi broadcast its own SSID so a phone can join it and upload pictures directly. The Pi has no internet uplink while in AP mode, which is fine here — it's just the frame talking to your phone.
+
+These instructions assume **Raspberry Pi OS Bookworm or newer**, which uses NetworkManager by default. Check with `nmcli --version`; if `nmcli` is missing you're on an older release and should follow the legacy `hostapd` path linked at the bottom.
+
+### Toggle with `ap-mode.sh`
+
+```bash
+./ap-mode.sh --enable    # prompts for a password, brings up the hotspot
+./ap-mode.sh --disable   # tears it down and reconnects to your previous Wi-Fi
+```
+
+Behind the scenes it uses NetworkManager: creates a `picinplace-ap` connection with `ipv4.method shared` (so the Pi runs a built-in DHCP server on `10.42.0.0/24`), `mode ap`, and WPA-PSK with the password you provide. Once it's up, the Pi is reachable at **http://10.42.0.1:8000** from any device joined to the `PicInPlace` SSID.
+
+`--disable` finds the most recently activated saved Wi-Fi connection that isn't `picinplace-ap` and brings it up. If you've never connected to another network from this Pi, connect manually first:
+
+```bash
+sudo nmcli device wifi connect 'YourSSID' password 'yourpassword'
+```
+
+### Notes & caveats
+
+- The Pi's built-in Wi-Fi has a single radio, so you can't be a client and an AP at the same time. While the hotspot is up, the Pi has no internet — perfect for the desk-frame use case, awkward for OTA updates. Plug into ethernet (or briefly disable the hotspot) when you need to `apt update`.
+- 5 GHz AP mode is restricted by regulatory domain on the Pi's chipset; the snippet above sticks to 2.4 GHz (`band bg`) which is the most universally supported.
+- If you're on **Bullseye or older** (no NetworkManager), the legacy path is `hostapd` + `dnsmasq` + a static IP on `wlan0`. The official guide at <https://www.raspberrypi.com/documentation/computers/configuration.html#setting-up-a-routed-wireless-access-point> still works.
+
+## Adding/changing dependencies
+
+```bash
+uv add somepackage                # runtime dep
+uv add --optional hardware foo    # only installed with --extra hardware
+uv sync                           # apply lockfile
+```

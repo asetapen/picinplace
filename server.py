@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 from datetime import datetime
@@ -19,7 +20,7 @@ except ImportError:
     HEIC_SUPPORT = False
     print("Warning: HEIC support not available. Install with: pip install pillow-heif")
 
-from inky.auto import auto
+MOCK_DISPLAY = "--mock" in sys.argv or os.environ.get("PICINPLACE_MOCK") == "1"
 
 # Configuration
 CONFIG = {
@@ -44,6 +45,17 @@ app.add_middleware(
 # Create directories for image storage
 UPLOAD_DIR = Path("uploaded_images")
 UPLOAD_DIR.mkdir(exist_ok=True)
+ORIGINALS_DIR = UPLOAD_DIR / "originals"
+ORIGINALS_DIR.mkdir(exist_ok=True)
+THUMB_DIR = UPLOAD_DIR / "thumbnails"
+THUMB_DIR.mkdir(exist_ok=True)
+CROPS_FILE = UPLOAD_DIR / "crops.json"
+ORIGINAL_MAX_EDGE = 2000  # cap originals so 50 pictures don't fill the SD card
+
+# In-memory map: display filename -> {"x": int, "y": int, "w": int, "h": int}
+# (crop rect in original-image pixel coordinates). Persisted to crops.json.
+crops: dict = {}
+crops_lock = threading.Lock()
 
 # Global variables
 current_image_index = 0
@@ -51,79 +63,334 @@ image_files: List[Path] = []
 cycling_enabled = True
 cycle_thread = None
 
-# Mock inky module for development (remove this when using real hardware)
+# Mock inky module for development / running without hardware (--mock)
 class MockInky:
     def set_image(self, image, saturation=None):
-        print(f"Setting image with saturation: {saturation}")
+        print(f"[mock display] set_image saturation={saturation} size={image.size}")
+        # Simulate the slow e-ink refresh so timings feel realistic in dev.
+        time.sleep(0.2)
 
     def show(self):
-        print("Displaying image on e-ink display")
+        print("[mock display] show()")
 
-# Initialize inky (use real import when on actual hardware)
-# from inky import InkyPHAT
-# inky = InkyPHAT("black")
-# inky = MockInky()  # Remove this line when using real hardware
-inky = auto(ask_user=True, verbose=True)
+
+def _init_display():
+    if MOCK_DISPLAY:
+        print("Running with --mock: no e-ink hardware will be used.")
+        return MockInky()
+    from inky.auto import auto
+    return auto(ask_user=True, verbose=True)
+
+
+inky = _init_display()
+
+# Serialize display writes so concurrent clicks don't fight for the e-ink bus.
+display_lock = threading.Lock()
 
 def resize_and_crop_image(image: Image.Image, target_size: tuple) -> Image.Image:
-    """Resize and crop image to target size maintaining aspect ratio."""
+    """Resize and crop image to target size maintaining aspect ratio (center crop)."""
     target_width, target_height = target_size
-    
-    # Calculate aspect ratios
     img_ratio = image.width / image.height
     target_ratio = target_width / target_height
-    
+
     if img_ratio > target_ratio:
-        # Image is wider than target, crop width
         new_height = target_height
         new_width = int(target_height * img_ratio)
     else:
-        # Image is taller than target, crop height
         new_width = target_width
         new_height = int(target_width / img_ratio)
-    
-    # Resize image
+
     image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    
-    # Crop to target size
     left = (new_width - target_width) // 2
     top = (new_height - target_height) // 2
-    right = left + target_width
-    bottom = top + target_height
-    
-    return image.crop((left, top, right, bottom))
+    return image.crop((left, top, left + target_width, top + target_height))
+
+
+# ---------------------------------------------------------------------------
+# Framing: originals storage, face detection, crop persistence
+# ---------------------------------------------------------------------------
+
+def _load_crops():
+    global crops
+    if CROPS_FILE.exists():
+        try:
+            with open(CROPS_FILE) as f:
+                crops = json.load(f)
+        except Exception as e:
+            print(f"Warning: couldn't read crops.json ({e}); starting empty")
+            crops = {}
+    else:
+        crops = {}
+
+
+def _save_crops():
+    tmp = CROPS_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(crops, f, indent=2)
+    os.replace(tmp, CROPS_FILE)
+
+
+def _clamp_crop(rect: dict, image_size: tuple, aspect: float) -> dict:
+    """Snap a crop rect to image bounds, integer pixels, exact display aspect."""
+    iw, ih = image_size
+    x, y, w, h = float(rect["x"]), float(rect["y"]), float(rect["w"]), float(rect["h"])
+
+    # Force aspect by adjusting whichever dim makes it fit inside the original
+    if w / h > aspect:
+        w = h * aspect
+    else:
+        h = w / aspect
+
+    # Shrink to fit if larger than the image
+    max_w = min(iw, ih * aspect)
+    if w > max_w:
+        w = max_w
+        h = w / aspect
+
+    # Clamp position
+    x = max(0.0, min(iw - w, x))
+    y = max(0.0, min(ih - h, y))
+    return {"x": int(round(x)), "y": int(round(y)),
+            "w": int(round(w)), "h": int(round(h))}
+
+
+def _center_crop_rect(image_size: tuple, aspect: float) -> dict:
+    iw, ih = image_size
+    if iw / ih > aspect:
+        ch = ih
+        cw = ih * aspect
+    else:
+        cw = iw
+        ch = iw / aspect
+    return {"x": int((iw - cw) / 2), "y": int((ih - ch) / 2),
+            "w": int(cw), "h": int(ch)}
+
+
+_face_cascade = None
+def _get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None:
+        import cv2
+        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        _face_cascade = cv2.CascadeClassifier(path)
+        if _face_cascade.empty():
+            raise RuntimeError(f"Failed to load Haar cascade from {path}")
+    return _face_cascade
+
+
+def auto_crop_from_faces(original_path: Path) -> dict:
+    """Pick a crop rect (in original pixels) that frames detected faces nicely.
+
+    Falls back to a center crop if face detection finds nothing or errors out.
+    """
+    import cv2
+    import numpy as np
+
+    aspect = CONFIG["display_size"][0] / CONFIG["display_size"][1]
+    img = cv2.imread(str(original_path))
+    if img is None:
+        # Pillow can sometimes open what cv2 won't; use it for dimensions
+        with Image.open(original_path) as pim:
+            return _center_crop_rect(pim.size, aspect)
+    h, w = img.shape[:2]
+
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cascade = _get_face_cascade()
+        faces = cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5,
+            minSize=(max(30, w // 40), max(30, h // 40)),
+        )
+    except Exception as e:
+        print(f"Face detection failed for {original_path.name}: {e}")
+        faces = []
+
+    if len(faces) == 0:
+        print(f"No faces detected in {original_path.name}; using center crop")
+        return _center_crop_rect((w, h), aspect)
+
+    x1 = min(int(f[0]) for f in faces)
+    y1 = min(int(f[1]) for f in faces)
+    x2 = max(int(f[0] + f[2]) for f in faces)
+    y2 = max(int(f[1] + f[3]) for f in faces)
+    bbox_w = x2 - x1
+    bbox_h = y2 - y1
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    # Aim the crop at roughly 3x the face cluster height — leaves room for
+    # shoulders/torso and breathing room around the edges. Widen if the face
+    # cluster is wider than that height-derived crop.
+    target_h = bbox_h * 3.0
+    target_w = target_h * aspect
+    if bbox_w * 2.0 > target_w:
+        target_w = bbox_w * 2.0
+        target_h = target_w / aspect
+
+    # Bias the crop center downward so faces sit in the upper third
+    # (headroom looks better than chin-room).
+    cy_target = cy + target_h * 0.12
+
+    rect = {"x": cx - target_w / 2, "y": cy_target - target_h / 2,
+            "w": target_w, "h": target_h}
+    rect = _clamp_crop(rect, (w, h), aspect)
+    print(f"Auto-framed {original_path.name}: {len(faces)} face(s) -> {rect}")
+    return rect
+
+
+def _normalize_to_jpeg(image: Image.Image) -> Image.Image:
+    """RGB + downscale to ORIGINAL_MAX_EDGE so kept originals stay manageable."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    w, h = image.size
+    longest = max(w, h)
+    if longest > ORIGINAL_MAX_EDGE:
+        scale = ORIGINAL_MAX_EDGE / longest
+        image = image.resize((int(w * scale), int(h * scale)),
+                             Image.Resampling.LANCZOS)
+    return image
+
+
+def apply_crop(filename: str, crop_rect: dict = None) -> Path:
+    """Re-cut the displayed JPEG (and its thumbnail) from the stored original.
+
+    If crop_rect is None, uses the saved crop for `filename`, or center-crops
+    if there isn't one.
+    """
+    original_path = ORIGINALS_DIR / filename
+    if not original_path.exists():
+        raise FileNotFoundError(f"No original for {filename}")
+
+    with Image.open(original_path) as src:
+        if src.mode != "RGB":
+            src = src.convert("RGB")
+        aspect = CONFIG["display_size"][0] / CONFIG["display_size"][1]
+        rect = crop_rect or crops.get(filename) or _center_crop_rect(src.size, aspect)
+        rect = _clamp_crop(rect, src.size, aspect)
+
+        cropped = src.crop((rect["x"], rect["y"],
+                            rect["x"] + rect["w"],
+                            rect["y"] + rect["h"]))
+        display_img = cropped.resize(tuple(CONFIG["display_size"]),
+                                     Image.Resampling.LANCZOS)
+
+        display_path = UPLOAD_DIR / filename
+        tmp_path = display_path.with_suffix(".jpg.tmp")
+        display_img.save(tmp_path, "JPEG", quality=95)
+        os.replace(tmp_path, display_path)
+
+    # Refresh thumbnail (delete + regenerate)
+    thumb_path = THUMB_DIR / f"thumb_{filename}"
+    if thumb_path.exists():
+        thumb_path.unlink()
+    create_thumbnail(display_path)
+
+    with crops_lock:
+        crops[filename] = rect
+        _save_crops()
+    return display_path
+
+
+def migrate_existing_images():
+    """For any displayed image that doesn't have an original on disk, treat
+    the current 800x480 JPEG as its own original. The user can still re-position
+    a crop inside it (degenerate), but at least nothing breaks."""
+    for img in UPLOAD_DIR.iterdir():
+        if not img.is_file() or img.suffix.lower() not in (".jpg", ".jpeg"):
+            continue
+        original_path = ORIGINALS_DIR / img.name
+        if not original_path.exists():
+            try:
+                with Image.open(img) as src:
+                    src = _normalize_to_jpeg(src)
+                    src.save(original_path, "JPEG", quality=95)
+                print(f"Migrated {img.name} -> originals/ (no pre-crop source available)")
+            except Exception as e:
+                print(f"Failed to migrate {img.name}: {e}")
+                continue
+        if img.name not in crops:
+            with Image.open(original_path) as o:
+                aspect = CONFIG["display_size"][0] / CONFIG["display_size"][1]
+                crops[img.name] = _center_crop_rect(o.size, aspect)
+    _save_crops()
+
+
+def _push_to_eink(image_path: Path):
+    """Slow path: actually drive the e-ink panel. Serialized via display_lock."""
+    with display_lock:
+        try:
+            image = Image.open(image_path)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            try:
+                inky.set_image(image, saturation=CONFIG["saturation"])
+            except TypeError:
+                inky.set_image(image)
+            inky.show()
+            print(f"Pushed to e-ink: {image_path.name}")
+        except Exception as e:
+            print(f"Error pushing to e-ink: {e}")
 
 
 def display_image(image_path: Path):
-    """Display image on e-ink display."""
+    """Full synchronous pipeline: update the web preview and the e-ink panel.
+
+    Used by the cycle thread and startup, where blocking is fine.
+    """
+    create_mock_frame_display(image_path)
+    _push_to_eink(image_path)
+
+
+def display_image_async(image_path: Path):
+    """Used by HTTP handlers: write the web preview synchronously (fast)
+    so the next /api/mock-frame fetch sees the new image, then push to
+    the (slow) e-ink panel from a background thread.
+    """
+    create_mock_frame_display(image_path)
+    threading.Thread(target=_push_to_eink, args=(image_path,), daemon=True).start()
+
+
+def create_mock_frame_display(image_path: Path):
+    """Write the full-color preview shown in the web UI as 'Mock Frame'.
+
+    Written atomically (temp file + os.replace) so a concurrent GET /api/mock-frame
+    can't observe a half-rewritten file — that races with Starlette's Content-Length
+    and raises h11 "Too much data for declared Content-Length".
+    """
     try:
+        mock_dir = Path("mock_frame")
+        mock_dir.mkdir(exist_ok=True)
+
         image = Image.open(image_path)
-        # Convert to RGB if necessary
+        if image.size != CONFIG["display_size"]:
+            image = resize_and_crop_image(image, CONFIG["display_size"])
         if image.mode != 'RGB':
             image = image.convert('RGB')
-        
-        # Display on e-ink
-        try:
-            inky.set_image(image, saturation=CONFIG["saturation"])
-        except TypeError:
-            inky.set_image(image)
-        inky.show()
-        
-        print(f"Displayed image: {image_path.name}")
+
+        mock_path = mock_dir / "current_display.jpg"
+        tmp_path = mock_dir / "current_display.jpg.tmp"
+        image.save(tmp_path, "JPEG", quality=95)
+        os.replace(tmp_path, mock_path)
+
+        print(f"Mock frame updated: {mock_path}")
     except Exception as e:
-        print(f"Error displaying image: {e}")
+        print(f"Error creating mock frame display: {e}")
 
 
 def cycle_images():
-    """Background thread to cycle through images."""
+    """Background thread to cycle through images.
+
+    Sleep first, then advance and display, so current_image_index always
+    names what is currently on the panel (matching what load_existing_images
+    already drew at startup, or whatever the user last selected).
+    """
     global current_image_index
-    
+
     while cycling_enabled:
-        if image_files:
-            display_image(image_files[current_image_index])
-            current_image_index = (current_image_index + 1) % len(image_files)
-        
         time.sleep(CONFIG["cycle_interval"])
+        if cycling_enabled and image_files:
+            current_image_index = (current_image_index + 1) % len(image_files)
+            display_image(image_files[current_image_index])
 
 
 def start_cycling():
@@ -160,14 +427,14 @@ def load_existing_images():
     """Load existing images from upload directory."""
     global image_files
     image_files = sorted(
-        [f for f in UPLOAD_DIR.iterdir() if f.suffix.lower() in ['.jpg', '.jpeg']],
+        [f for f in UPLOAD_DIR.iterdir()
+         if f.is_file() and f.suffix.lower() in ['.jpg', '.jpeg']],
         key=lambda x: x.stat().st_mtime
     )[-CONFIG["max_images"]:]
-    
-    # Create thumbnails for existing images
+
     for img in image_files:
         create_thumbnail(img)
-    
+
     if image_files:
         display_image(image_files[0])
 
@@ -175,75 +442,72 @@ def load_existing_images():
 @app.on_event("startup")
 async def startup_event():
     """Initialize the server and start image cycling."""
+    _load_crops()
     load_existing_images()
+    migrate_existing_images()  # backfill originals + crops for pre-existing JPEGs
     start_cycling()
 
 
 @app.post("/api/upload")
 async def upload_image(file: UploadFile = File(...)):
-    """Handle image upload."""
+    """Handle image upload. Saves a downsized original, runs face detection
+    to pick an initial crop, then writes the 800x480 display JPEG."""
     try:
-        # Check if file is HEIC and HEIC support is not available
         if file.filename.lower().endswith(('.heic', '.heif')) and not HEIC_SUPPORT:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="HEIC files are not supported. Please install pillow-heif: pip install pillow-heif"
             )
-        
-        # Read image data
+
         contents = await file.read()
-        
-        # Handle HEIC files
-        if file.filename.lower().endswith(('.heic', '.heif')):
-            try:
-                image = Image.open(io.BytesIO(contents))
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Error processing HEIC file: {str(e)}"
-                )
-        else:
+        try:
             image = Image.open(io.BytesIO(contents))
-        
-        # Resize and crop image
-        processed_image = resize_and_crop_image(image, CONFIG["display_size"])
-        
-        # Convert to RGB if necessary
-        if processed_image.mode != 'RGB':
-            processed_image = processed_image.convert('RGB')
-        
-        # Save as JPEG
+        except Exception as e:
+            raise HTTPException(status_code=400,
+                                detail=f"Error opening image: {e}")
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"image_{timestamp}.jpg"
-        filepath = UPLOAD_DIR / filename
-        
-        processed_image.save(filepath, "JPEG", quality=95)
-        
-        # Update image list
-        global image_files
+        original_path = ORIGINALS_DIR / filename
+
+        # Persist the original (downsized to ORIGINAL_MAX_EDGE) so we can re-crop later.
+        normalized = _normalize_to_jpeg(image)
+        normalized.save(original_path, "JPEG", quality=95)
+
+        # Auto-frame from face detection, then cut the display JPEG + thumbnail.
+        initial_crop = auto_crop_from_faces(original_path)
+        with crops_lock:
+            crops[filename] = initial_crop
+            _save_crops()
+        filepath = apply_crop(filename)
+
+        global image_files, current_image_index
         image_files.append(filepath)
-        
-        # Create thumbnail
-        create_thumbnail(filepath)
-        
-        # Remove oldest images if exceeding limit
+
+        # Evict the oldest if over max_images (also drops its original + crop entry)
         if len(image_files) > CONFIG["max_images"]:
             oldest = image_files.pop(0)
-            oldest.unlink()
-            # Remove thumbnail too
-            thumb_path = UPLOAD_DIR / "thumbnails" / f"thumb_{oldest.name}"
-            if thumb_path.exists():
-                thumb_path.unlink()
-        
-        # Display the new image immediately
-        display_image(filepath)
-        
+            _remove_image_files(oldest.name)
+
+        current_image_index = len(image_files) - 1
+        display_image_async(filepath)
+
         return {"message": "Image uploaded successfully", "filename": filename}
-    
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _remove_image_files(filename: str):
+    """Delete the display JPEG, thumbnail, original, and crop entry for `filename`."""
+    (UPLOAD_DIR / filename).unlink(missing_ok=True)
+    (THUMB_DIR / f"thumb_{filename}").unlink(missing_ok=True)
+    (ORIGINALS_DIR / filename).unlink(missing_ok=True)
+    with crops_lock:
+        crops.pop(filename, None)
+        _save_crops()
 
 
 @app.get("/api/images")
@@ -291,6 +555,25 @@ async def control_cycling(action: str):
         raise HTTPException(status_code=400, detail="Invalid action")
 
 
+@app.post("/api/display/{index}")
+async def display_image_by_index(index: int):
+    """Display a specific image by index."""
+    global current_image_index
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No images available")
+    
+    if index < 0 or index >= len(image_files):
+        raise HTTPException(status_code=404, detail="Image index out of range")
+    
+    # Update the current index immediately so /api/images reflects the
+    # new selection on the next poll, and push to the e-ink in the background.
+    current_image_index = index
+    display_image_async(image_files[index])
+
+    return {"message": "Image displayed", "index": index}
+
+
 @app.get("/api/heic-support")
 async def check_heic_support():
     """Check if HEIC support is available."""
@@ -311,6 +594,99 @@ async def get_thumbnail(filename: str):
             if thumb:
                 return FileResponse(thumb)
         raise HTTPException(status_code=404, detail="Thumbnail not found")
+
+
+@app.delete("/api/images/{filename}")
+async def delete_image(filename: str):
+    """Delete a specific image (display JPEG, thumbnail, original, crop entry)."""
+    global image_files, current_image_index
+
+    image_path = UPLOAD_DIR / filename
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    try:
+        idx = next(i for i, f in enumerate(image_files) if f.name == filename)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Image not tracked")
+
+    image_files.pop(idx)
+    _remove_image_files(filename)
+
+    if image_files:
+        current_image_index = current_image_index % len(image_files)
+    else:
+        current_image_index = 0
+
+    return {"message": "Image deleted", "filename": filename}
+
+
+@app.get("/api/original/{filename}")
+async def get_original(filename: str):
+    """Serve the stored original (for the re-frame UI)."""
+    p = ORIGINALS_DIR / filename
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Original not found")
+    return FileResponse(p)
+
+
+@app.get("/api/crop/{filename}")
+async def get_crop(filename: str):
+    """Return the current crop rect + the original image dimensions."""
+    original_path = ORIGINALS_DIR / filename
+    if not original_path.exists():
+        raise HTTPException(status_code=404, detail="Original not found")
+    with Image.open(original_path) as o:
+        ow, oh = o.size
+    aspect = CONFIG["display_size"][0] / CONFIG["display_size"][1]
+    rect = crops.get(filename) or _center_crop_rect((ow, oh), aspect)
+    return {
+        "crop": rect,
+        "original_size": {"w": ow, "h": oh},
+        "display_size": list(CONFIG["display_size"]),
+    }
+
+
+@app.post("/api/crop/{filename}")
+async def set_crop(filename: str, rect: dict):
+    """Replace the crop for `filename` and re-render the display JPEG.
+    Body: {"x": int, "y": int, "w": int, "h": int} in original-image pixels."""
+    original_path = ORIGINALS_DIR / filename
+    if not original_path.exists():
+        raise HTTPException(status_code=404, detail="Original not found")
+    for k in ("x", "y", "w", "h"):
+        if k not in rect:
+            raise HTTPException(status_code=400, detail=f"Missing field: {k}")
+
+    new_display_path = apply_crop(filename, rect)
+
+    # If the re-framed image is the one currently shown, push to the panel.
+    if image_files and 0 <= current_image_index < len(image_files):
+        if image_files[current_image_index].name == filename:
+            display_image_async(new_display_path)
+
+    return {"message": "Crop updated", "crop": crops[filename]}
+
+
+@app.post("/api/autocrop/{filename}")
+async def autocrop(filename: str):
+    """Suggest a face-detection crop without persisting. The client decides
+    whether to keep it (POST /api/crop) or discard."""
+    original_path = ORIGINALS_DIR / filename
+    if not original_path.exists():
+        raise HTTPException(status_code=404, detail="Original not found")
+    rect = auto_crop_from_faces(original_path)
+    return {"crop": rect}
+
+
+@app.get("/api/mock-frame")
+async def get_mock_frame():
+    """Get the current mock frame display."""
+    mock_path = Path("mock_frame") / "current_display.jpg"
+    if mock_path.exists():
+        return FileResponse(mock_path)
+    else:
+        raise HTTPException(status_code=404, detail="Mock frame not available")
 
 
 # Serve React frontend
@@ -376,6 +752,16 @@ async def serve_frontend():
         .image-item.current {
             border: 3px solid #4a90e2;
             box-shadow: 0 4px 12px rgba(74, 144, 226, 0.3);
+        }
+        .delete-btn {
+            background-color: #e53935;
+            font-size: 12px;
+            padding: 4px 10px;
+            margin-top: 6px;
+            width: 100%;
+        }
+        .delete-btn:hover {
+            background-color: #b71c1c;
         }
         .thumbnail {
             width: 100%;
@@ -454,21 +840,118 @@ async def serve_frontend():
             background-color: #ffebee;
             color: #c62828;
         }
+        .mock-frame {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .frame-container {
+            display: inline-block;
+            border: 8px solid #333;
+            border-radius: 12px;
+            background: #f5f5f5;
+            padding: 10px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        .frame-display {
+            max-width: 400px;
+            max-height: 240px;
+            width: auto;
+            height: auto;
+            border-radius: 4px;
+            display: block;
+        }
+        .frame-placeholder {
+            width: 400px;
+            height: 240px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 16px;
+        }
+        .reframe-btn {
+            background-color: #6f42c1;
+            font-size: 12px;
+            padding: 4px 10px;
+            margin-top: 6px;
+            width: 100%;
+        }
+        .reframe-btn:hover { background-color: #553098; }
+        .modal-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.6);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 1000;
+        }
+        .modal {
+            background: white; border-radius: 8px; padding: 20px;
+            max-width: 92vw; max-height: 92vh;
+            overflow: auto;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        }
+        .modal h3 { margin-top: 0; }
+        .crop-stage {
+            position: relative;
+            display: inline-block;
+            user-select: none;
+            background: #000;
+            line-height: 0;
+        }
+        .crop-image {
+            display: block;
+            max-width: min(80vw, 720px);
+            max-height: 60vh;
+            width: auto; height: auto;
+            -webkit-user-drag: none;
+            user-select: none;
+            pointer-events: none;
+        }
+        .crop-handle {
+            position: absolute;
+            width: 14px; height: 14px;
+            background: white;
+            border: 2px solid #4a90e2;
+            border-radius: 2px;
+            box-sizing: border-box;
+        }
+        .handle-nw { top: -8px;    left: -8px;   cursor: nwse-resize; }
+        .handle-ne { top: -8px;    right: -8px;  cursor: nesw-resize; }
+        .handle-sw { bottom: -8px; left: -8px;   cursor: nesw-resize; }
+        .handle-se { bottom: -8px; right: -8px;  cursor: nwse-resize; }
+        .modal-actions {
+            display: flex; gap: 10px; margin-top: 16px; align-items: center;
+        }
+        .btn-secondary {
+            background-color: white;
+            color: #333;
+            border: 1px solid #ccc;
+        }
+        .btn-secondary:hover { background-color: #f0f0f0; }
+        .modal-hint {
+            margin: 4px 0 12px; color: #666; font-size: 13px;
+        }
+        .modal-loading {
+            padding: 60px 40px; text-align: center; color: #888;
+        }
     </style>
 </head>
 <body>
     <div id="root"></div>
     <script type="text/babel">
-        const { useState, useEffect, useCallback } = React;
+        const { useState, useEffect, useCallback, useRef } = React;
 
-        function ImageThumbnail({ image, index, isCurrent, onClick }) {
+        function ImageThumbnail({ image, isCurrent, thumbVersion, onClick, onDelete, onReframe }) {
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(false);
 
             return (
                 <div
                     className={`image-item ${isCurrent ? 'current' : ''}`}
-                    onClick={onClick}
                     title={`Click to display ${image}`}
                 >
                     {loading && !error && (
@@ -477,19 +960,229 @@ async def serve_frontend():
                     {error && (
                         <div className="thumbnail-loading">No preview</div>
                     )}
-                    <img 
-                        src={`/api/thumbnail/${image}`} 
+                    <img
+                        src={`/api/thumbnail/${image}?v=${thumbVersion || 0}`}
                         alt={image}
                         className="thumbnail"
-                        style={{ display: loading || error ? 'none' : 'block' }}
+                        style={{ display: loading || error ? 'none' : 'block', cursor: 'pointer' }}
                         onLoad={() => setLoading(false)}
                         onError={() => {
                             setLoading(false);
                             setError(true);
                         }}
+                        onClick={onClick}
                     />
-                    <div className="image-name">{image.replace(/^image_/, '').replace('.jpg', '')}</div>
+                    <div className="image-name" onClick={onClick} style={{ cursor: 'pointer' }}>{image.replace(/^image_/, '').replace('.jpg', '')}</div>
                     {isCurrent && <div className="current-label">Currently Displayed</div>}
+                    <button
+                        className="reframe-btn"
+                        onClick={(e) => { e.stopPropagation(); onReframe(image); }}
+                    >Reframe</button>
+                    <button
+                        className="delete-btn"
+                        onClick={(e) => { e.stopPropagation(); onDelete(image); }}
+                    >Delete</button>
+                </div>
+            );
+        }
+
+        function CropEditor({ filename, onSave, onClose, onError }) {
+            const [crop, setCrop] = useState(null);
+            const [origSize, setOrigSize] = useState(null);
+            const [dispSize, setDispSize] = useState([800, 480]);
+            const [scale, setScale] = useState(1);
+            const [saving, setSaving] = useState(false);
+            const [autoframing, setAutoframing] = useState(false);
+            const imgRef = useRef(null);
+            const dragRef = useRef(null);
+
+            useEffect(() => {
+                let cancelled = false;
+                fetch(`/api/crop/${filename}`)
+                    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                    .then(data => {
+                        if (cancelled) return;
+                        setCrop(data.crop);
+                        setOrigSize(data.original_size);
+                        setDispSize(data.display_size);
+                    })
+                    .catch(e => { if (!cancelled) onError('Could not load crop info: ' + e.message); });
+                return () => { cancelled = true; };
+            }, [filename]);
+
+            const aspect = dispSize[0] / dispSize[1];
+            const MIN_W = Math.max(80, dispSize[0] * 0.1);
+
+            const measure = useCallback(() => {
+                if (imgRef.current && origSize) {
+                    const r = imgRef.current.getBoundingClientRect();
+                    if (r.width > 0) setScale(r.width / origSize.w);
+                }
+            }, [origSize]);
+            useEffect(() => {
+                measure();
+                window.addEventListener('resize', measure);
+                return () => window.removeEventListener('resize', measure);
+            }, [measure]);
+
+            const clampRect = (x, y, w, h) => {
+                if (!origSize) return { x, y, w, h };
+                // Aspect-lock: expand whichever dim is smaller (relative to aspect).
+                if (w / h > aspect) h = w / aspect;
+                else w = h * aspect;
+                if (w < MIN_W) { w = MIN_W; h = w / aspect; }
+                // Shrink to fit in the original
+                if (w > origSize.w) { w = origSize.w; h = w / aspect; }
+                if (h > origSize.h) { h = origSize.h; w = h * aspect; }
+                x = Math.max(0, Math.min(origSize.w - w, x));
+                y = Math.max(0, Math.min(origSize.h - h, y));
+                return { x, y, w, h };
+            };
+
+            const onMove = (e) => {
+                const d = dragRef.current;
+                if (!d) return;
+                if (d.mode === 'move') {
+                    const dx = (e.clientX - d.startClient.x) / d.scale;
+                    const dy = (e.clientY - d.startClient.y) / d.scale;
+                    setCrop(clampRect(d.startCrop.x + dx, d.startCrop.y + dy,
+                                       d.startCrop.w, d.startCrop.h));
+                    return;
+                }
+                // Resize: anchor (opposite corner) stays fixed.
+                const mx = (e.clientX - d.imgOrigin.x) / d.scale;
+                const my = (e.clientY - d.imgOrigin.y) / d.scale;
+                let w = Math.abs(mx - d.anchor.x);
+                let h = Math.abs(my - d.anchor.y);
+                // Expand smaller dim to keep aspect.
+                if (w / h > aspect) h = w / aspect;
+                else w = h * aspect;
+                const x = d.mode.includes('w') ? d.anchor.x - w : d.anchor.x;
+                const y = d.mode.includes('n') ? d.anchor.y - h : d.anchor.y;
+                setCrop(clampRect(x, y, w, h));
+            };
+
+            const onUp = () => {
+                dragRef.current = null;
+                document.removeEventListener('pointermove', onMove);
+                document.removeEventListener('pointerup', onUp);
+            };
+
+            const startDrag = (mode) => (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!crop || !imgRef.current || !origSize) return;
+                const rect = imgRef.current.getBoundingClientRect();
+                const s = rect.width / origSize.w;
+                dragRef.current = {
+                    mode,
+                    startClient: { x: e.clientX, y: e.clientY },
+                    startCrop: { ...crop },
+                    scale: s,
+                    imgOrigin: { x: rect.left, y: rect.top },
+                    anchor: mode === 'move' ? null : {
+                        x: mode.includes('w') ? crop.x + crop.w : crop.x,
+                        y: mode.includes('n') ? crop.y + crop.h : crop.y,
+                    },
+                };
+                document.addEventListener('pointermove', onMove);
+                document.addEventListener('pointerup', onUp);
+            };
+
+            const save = async () => {
+                if (!crop) return;
+                setSaving(true);
+                try {
+                    const res = await fetch(`/api/crop/${filename}`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            x: Math.round(crop.x), y: Math.round(crop.y),
+                            w: Math.round(crop.w), h: Math.round(crop.h),
+                        }),
+                    });
+                    if (!res.ok) throw new Error((await res.json()).detail || 'HTTP ' + res.status);
+                    onSave();
+                } catch (e) {
+                    onError('Save failed: ' + e.message);
+                    setSaving(false);
+                }
+            };
+
+            const autoFrame = async () => {
+                setAutoframing(true);
+                try {
+                    const res = await fetch(`/api/autocrop/${filename}`, {method: 'POST'});
+                    if (!res.ok) throw new Error((await res.json()).detail || 'HTTP ' + res.status);
+                    const data = await res.json();
+                    setCrop(clampRect(data.crop.x, data.crop.y, data.crop.w, data.crop.h));
+                } catch (e) {
+                    onError('Auto-frame failed: ' + e.message);
+                } finally {
+                    setAutoframing(false);
+                }
+            };
+
+            const overlay = (crop && origSize) ? {
+                position: 'absolute',
+                left: crop.x * scale, top: crop.y * scale,
+                width: crop.w * scale, height: crop.h * scale,
+                border: '2px solid #4a90e2',
+                boxShadow: '0 0 0 9999px rgba(0,0,0,0.5)',
+                cursor: 'move',
+                boxSizing: 'border-box',
+            } : null;
+
+            // Dismiss on actual backdrop press (not on a drag release that
+            // happens to end on the backdrop). Compare target to currentTarget
+            // so only direct presses on the overlay count.
+            const onBackdropDown = (e) => {
+                if (e.target === e.currentTarget) onClose();
+            };
+
+            const loaded = crop && origSize;
+
+            return (
+                <div className="modal-overlay" onMouseDown={onBackdropDown}>
+                    <div className="modal" onMouseDown={e => e.stopPropagation()}>
+                        <h3>Re-frame {filename}</h3>
+                        <p className="modal-hint">
+                            Drag inside the rectangle to move it; drag corners to resize.
+                            Aspect locked to {dispSize[0]}×{dispSize[1]}.
+                        </p>
+                        {loaded ? (
+                            <div className="crop-stage">
+                                <img ref={imgRef}
+                                     src={`/api/original/${filename}`}
+                                     alt={filename}
+                                     className="crop-image"
+                                     onLoad={measure}
+                                     draggable={false} />
+                                {overlay && (
+                                    <div style={overlay} onPointerDown={startDrag('move')}>
+                                        <div className="crop-handle handle-nw" onPointerDown={startDrag('nw')} />
+                                        <div className="crop-handle handle-ne" onPointerDown={startDrag('ne')} />
+                                        <div className="crop-handle handle-sw" onPointerDown={startDrag('sw')} />
+                                        <div className="crop-handle handle-se" onPointerDown={startDrag('se')} />
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="modal-loading">Loading original…</div>
+                        )}
+                        {loaded && (
+                            <div className="modal-actions">
+                                <button onClick={autoFrame} disabled={autoframing}>
+                                    {autoframing ? 'Detecting…' : 'Auto-frame faces'}
+                                </button>
+                                <div style={{flex: 1}} />
+                                <button className="btn-secondary" onClick={onClose}>Cancel</button>
+                                <button onClick={save} disabled={saving}>
+                                    {saving ? 'Saving…' : 'Save'}
+                                </button>
+                            </div>
+                        )}
+                    </div>
                 </div>
             );
         }
@@ -503,6 +1196,9 @@ async def serve_frontend():
             const [status, setStatus] = useState('');
             const [error, setError] = useState('');
             const [heicSupport, setHeicSupport] = useState(false);
+            const [mockFrameKey, setMockFrameKey] = useState(0);
+            const [thumbVersion, setThumbVersion] = useState(0);
+            const [reframing, setReframing] = useState(null);
 
             useEffect(() => {
                 fetchImages();
@@ -527,7 +1223,14 @@ async def serve_frontend():
                     const response = await fetch('/api/images');
                     const data = await response.json();
                     setImages(data.images);
-                    setCurrentIndex(data.current_index);
+                    setCurrentIndex(prev => {
+                        // Whenever the displayed image changes (cycle thread
+                        // advance, or anything else), re-fetch the mock preview.
+                        if (prev !== data.current_index) {
+                            setMockFrameKey(k => k + 1);
+                        }
+                        return data.current_index;
+                    });
                 } catch (err) {
                     console.error('Error fetching images:', err);
                 }
@@ -590,6 +1293,8 @@ async def serve_frontend():
                     if (response.ok) {
                         setStatus('Image uploaded successfully!');
                         fetchImages();
+                        // Refresh mock frame display
+                        setMockFrameKey(prev => prev + 1);
                         setTimeout(() => setStatus(''), 3000);
                     } else {
                         const errorData = await response.json();
@@ -602,11 +1307,34 @@ async def serve_frontend():
             };
 
             const displayImage = async (index) => {
+                // Optimistic: mark the clicked thumbnail as current immediately.
+                // The mock preview is rewritten synchronously by the server before
+                // the response returns, so we wait for the POST to land before
+                // bumping mockFrameKey — otherwise we'd re-fetch the stale file.
+                setCurrentIndex(index);
                 try {
-                    await fetch(`/api/display/${index}`);
+                    await fetch(`/api/display/${index}`, { method: 'POST' });
+                    setMockFrameKey(prev => prev + 1);
                     fetchImages();
                 } catch (err) {
                     console.error('Error displaying image:', err);
+                }
+            };
+
+            const deleteImage = async (filename) => {
+                try {
+                    const response = await fetch(`/api/images/${filename}`, { method: 'DELETE' });
+                    if (response.ok) {
+                        setStatus('Image deleted');
+                        fetchImages();
+                        setTimeout(() => setStatus(''), 3000);
+                    } else {
+                        const errorData = await response.json();
+                        throw new Error(errorData.detail || 'Delete failed');
+                    }
+                } catch (err) {
+                    setError(err.message || 'Error deleting image');
+                    setTimeout(() => setError(''), 5000);
                 }
             };
 
@@ -671,6 +1399,24 @@ async def serve_frontend():
                         <span>Cycling: {cycling ? 'ON' : 'OFF'}</span>
                     </div>
 
+                    <div className="mock-frame">
+                        <h3>Current Display (Mock Frame)</h3>
+                        <div className="frame-container">
+                            <img 
+                                src={`/api/mock-frame?v=${mockFrameKey}`}
+                                alt="Current frame display"
+                                className="frame-display"
+                                onError={(e) => {
+                                    e.target.style.display = 'none';
+                                    e.target.nextSibling.style.display = 'block';
+                                }}
+                            />
+                            <div className="frame-placeholder" style={{ display: 'none' }}>
+                                No image displayed
+                            </div>
+                        </div>
+                    </div>
+
                     <div className="config">
                         <h3>Configuration</h3>
                         <div>
@@ -715,12 +1461,33 @@ async def serve_frontend():
                             <ImageThumbnail
                                 key={image}
                                 image={image}
-                                index={index}
                                 isCurrent={index === currentIndex}
+                                thumbVersion={thumbVersion}
                                 onClick={() => displayImage(index)}
+                                onDelete={deleteImage}
+                                onReframe={(name) => setReframing(name)}
                             />
                         ))}
                     </div>
+
+                    {reframing && (
+                        <CropEditor
+                            filename={reframing}
+                            onSave={() => {
+                                setReframing(null);
+                                setStatus('Crop saved');
+                                setMockFrameKey(k => k + 1);
+                                setThumbVersion(v => v + 1);
+                                fetchImages();
+                                setTimeout(() => setStatus(''), 3000);
+                            }}
+                            onClose={() => setReframing(null)}
+                            onError={(msg) => {
+                                setError(msg);
+                                setTimeout(() => setError(''), 5000);
+                            }}
+                        />
+                    )}
                 </div>
             );
         }

@@ -6,9 +6,17 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.13",
-    "inky>=2.1.0",
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
     "pillow>=11.2.1",
     "pillow-heif>=0.22.0",
     "python-multipart>=0.0.20",
     "uvicorn>=0.34.3",
+]
+
+[project.optional-dependencies]
+# Real e-ink display drivers. Only installable on Linux (Raspberry Pi) —
+# spidev/gpiod won't build on macOS. Skip on dev machines and use --mock.
+hardware = [
+    "inky>=2.1.0",
 ]
