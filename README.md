@@ -39,8 +39,17 @@ Then point a browser at `http://<pi-hostname>.local:8000`.
 
 - Drag-and-drop or click to upload an image (JPEG/PNG/GIF/WebP/HEIC).
 - Click any thumbnail to push it to the display. The selection indicator updates instantly; the actual e-ink refresh happens in the background (e-ink panels take 15-30s to redraw).
+- **Reframe** on any thumbnail opens a crop editor: drag the rectangle to reposition, drag a corner to resize (aspect-locked to the display). **Auto-frame faces** runs OpenCV's Haar cascade to suggest a crop centered on detected faces (with a bit of headroom); falls back to a center crop if it finds nothing. **Save** re-cuts the display JPEG and pushes the new framing to the e-ink if the image is currently shown.
 - "Stop/Start Cycling" pauses the auto-rotation.
 - Adjust max image count, cycle interval, and saturation, then "Update Configuration" to persist.
+
+### How framing storage works
+
+- The original (downsized to a max edge of 2000px) is kept under `uploaded_images/originals/`.
+- The 800×480 JPEG you see on the panel is re-derived from the original whenever the crop changes.
+- Crops are stored in `uploaded_images/crops.json` as `{x, y, w, h}` rects in original-pixel coordinates.
+- On upload, OpenCV face detection runs once to pick the initial crop. You can re-run it any time from the Reframe modal.
+- Existing images that pre-date this feature are migrated lazily: their current 800×480 JPEG is copied into `originals/` and used as its own source — re-framing them just repositions a 5:3 window inside the existing crop, since the pre-crop pixels weren't kept. New uploads keep proper originals.
 
 ## Configuration (`config.json`)
 
@@ -55,12 +64,16 @@ Then point a browser at `http://<pi-hostname>.local:8000`.
 
 | Method | Path                       | Purpose                                  |
 | ------ | -------------------------- | ---------------------------------------- |
-| POST   | `/api/upload`              | Upload a file (multipart).               |
+| POST   | `/api/upload`              | Upload a file (multipart). Saves original + runs face-detect for initial crop. |
 | GET    | `/api/images`              | List stored images + current index.      |
 | POST   | `/api/display/{index}`     | Show image at index. Returns immediately. |
 | POST   | `/api/cycle/{start\|stop}` | Toggle auto-rotation.                    |
 | GET    | `/api/thumbnail/{name}`    | Get a 150×90 thumbnail.                  |
-| DELETE | `/api/images/{name}`       | Delete an image.                         |
+| DELETE | `/api/images/{name}`       | Delete an image (display JPEG + thumbnail + original + crop entry). |
+| GET    | `/api/original/{name}`     | Serve the stored original (for the re-frame UI). |
+| GET    | `/api/crop/{name}`         | Return `{crop, original_size, display_size}`. |
+| POST   | `/api/crop/{name}`         | Persist a new crop `{x,y,w,h}` and re-render the display JPEG. |
+| POST   | `/api/autocrop/{name}`     | Suggest a face-detect crop *without* persisting. Client decides whether to POST `/api/crop/`. |
 | GET    | `/api/config`              | Get current config.                      |
 | POST   | `/api/config`              | Patch config (any subset of keys).       |
 | GET    | `/api/mock-frame`          | Full-color preview JPEG.                 |
