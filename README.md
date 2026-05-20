@@ -100,36 +100,20 @@ Useful at work where personal devices can't join the corporate network: have the
 
 These instructions assume **Raspberry Pi OS Bookworm or newer**, which uses NetworkManager by default. Check with `nmcli --version`; if `nmcli` is missing you're on an older release and should follow the legacy `hostapd` path linked at the bottom.
 
-### One-time setup
+### Toggle with `ap-mode.sh`
 
 ```bash
-# Create a persistent hotspot named "PicInPlace" on wlan0.
-sudo nmcli connection add type wifi ifname wlan0 con-name picinplace-ap \
-  autoconnect yes ssid PicInPlace
-sudo nmcli connection modify picinplace-ap \
-  802-11-wireless.mode ap \
-  802-11-wireless.band bg \
-  ipv4.method shared \
-  ipv6.method disabled \
-  wifi-sec.key-mgmt wpa-psk \
-  wifi-sec.psk 'pick-a-good-password'
-# Make it the preferred connection so it wins over any saved Wi-Fi networks.
-sudo nmcli connection modify picinplace-ap connection.autoconnect-priority 100
-sudo nmcli connection up picinplace-ap
+./ap-mode.sh --enable    # prompts for a password, brings up the hotspot
+./ap-mode.sh --disable   # tears it down and reconnects to your previous Wi-Fi
 ```
 
-The Pi will be reachable at **http://10.42.0.1:8000** from any device joined to the `PicInPlace` SSID (NetworkManager's `ipv4.method shared` uses the `10.42.0.0/24` range and runs a built-in DHCP server).
+Behind the scenes it uses NetworkManager: creates a `picinplace-ap` connection with `ipv4.method shared` (so the Pi runs a built-in DHCP server on `10.42.0.0/24`), `mode ap`, and WPA-PSK with the password you provide. Once it's up, the Pi is reachable at **http://10.42.0.1:8000** from any device joined to the `PicInPlace` SSID.
 
-### Going back to a normal Wi-Fi client
+`--disable` finds the most recently activated saved Wi-Fi connection that isn't `picinplace-ap` and brings it up. If you've never connected to another network from this Pi, connect manually first:
 
 ```bash
-sudo nmcli connection down picinplace-ap
-sudo nmcli connection modify picinplace-ap autoconnect no
-# Then connect to a regular network:
 sudo nmcli device wifi connect 'YourSSID' password 'yourpassword'
 ```
-
-To re-enable the hotspot later: `sudo nmcli connection up picinplace-ap`.
 
 ### Notes & caveats
 

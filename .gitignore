@@ -195,3 +195,5 @@ cython_debug/
 
 # PicInPlace runtime state
 mock_frame/current_display.jpg
+
+.claude/
