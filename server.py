@@ -132,14 +132,11 @@ def create_mock_frame_display(image_path: Path):
             image = resize_and_crop_image(image, CONFIG["display_size"])
         
         # Apply saturation effect to simulate e-ink display
-        if image.mode == 'RGB':
-            # Convert to grayscale for e-ink simulation
-            grayscale = image.convert('L')
-            # Apply slight tint to simulate e-ink colors
-            mock_image = Image.new('RGB', grayscale.size, (250, 245, 230))  # Off-white background
-            mock_image.paste(grayscale, mask=grayscale)
-        else:
-            mock_image = image
+        from PIL import ImageEnhance
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        enhancer = ImageEnhance.Color(image)
+        mock_image = enhancer.enhance(CONFIG["saturation"])
         
         # Save as current display
         mock_path = mock_dir / "current_display.jpg"
@@ -369,6 +366,39 @@ async def get_thumbnail(filename: str):
         raise HTTPException(status_code=404, detail="Thumbnail not found")
 
 
+@app.delete("/api/images/{filename}")
+async def delete_image(filename: str):
+    """Delete a specific image."""
+    global image_files, current_image_index
+
+    image_path = UPLOAD_DIR / filename
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    # Find index in image_files
+    try:
+        idx = next(i for i, f in enumerate(image_files) if f.name == filename)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Image not tracked")
+
+    # Remove from list
+    image_files.pop(idx)
+
+    # Delete files
+    image_path.unlink()
+    thumb_path = UPLOAD_DIR / "thumbnails" / f"thumb_{filename}"
+    if thumb_path.exists():
+        thumb_path.unlink()
+
+    # Adjust current index so it stays valid
+    if image_files:
+        current_image_index = current_image_index % len(image_files)
+    else:
+        current_image_index = 0
+
+    return {"message": "Image deleted", "filename": filename}
+
+
 @app.get("/api/mock-frame")
 async def get_mock_frame():
     """Get the current mock frame display."""
@@ -442,6 +472,16 @@ async def serve_frontend():
         .image-item.current {
             border: 3px solid #4a90e2;
             box-shadow: 0 4px 12px rgba(74, 144, 226, 0.3);
+        }
+        .delete-btn {
+            background-color: #e53935;
+            font-size: 12px;
+            padding: 4px 10px;
+            margin-top: 6px;
+            width: 100%;
+        }
+        .delete-btn:hover {
+            background-color: #b71c1c;
         }
         .thumbnail {
             width: 100%;
@@ -561,14 +601,13 @@ async def serve_frontend():
     <script type="text/babel">
         const { useState, useEffect, useCallback } = React;
 
-        function ImageThumbnail({ image, index, isCurrent, onClick }) {
+        function ImageThumbnail({ image, index, isCurrent, onClick, onDelete }) {
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(false);
 
             return (
                 <div
                     className={`image-item ${isCurrent ? 'current' : ''}`}
-                    onClick={onClick}
                     title={`Click to display ${image}`}
                 >
                     {loading && !error && (
@@ -577,19 +616,24 @@ async def serve_frontend():
                     {error && (
                         <div className="thumbnail-loading">No preview</div>
                     )}
-                    <img 
-                        src={`/api/thumbnail/${image}`} 
+                    <img
+                        src={`/api/thumbnail/${image}`}
                         alt={image}
                         className="thumbnail"
-                        style={{ display: loading || error ? 'none' : 'block' }}
+                        style={{ display: loading || error ? 'none' : 'block', cursor: 'pointer' }}
                         onLoad={() => setLoading(false)}
                         onError={() => {
                             setLoading(false);
                             setError(true);
                         }}
+                        onClick={onClick}
                     />
-                    <div className="image-name">{image.replace(/^image_/, '').replace('.jpg', '')}</div>
+                    <div className="image-name" onClick={onClick} style={{ cursor: 'pointer' }}>{image.replace(/^image_/, '').replace('.jpg', '')}</div>
                     {isCurrent && <div className="current-label">Currently Displayed</div>}
+                    <button
+                        className="delete-btn"
+                        onClick={(e) => { e.stopPropagation(); onDelete(image); }}
+                    >Delete</button>
                 </div>
             );
         }
@@ -712,6 +756,23 @@ async def serve_frontend():
                     setMockFrameKey(prev => prev + 1);
                 } catch (err) {
                     console.error('Error displaying image:', err);
+                }
+            };
+
+            const deleteImage = async (filename) => {
+                try {
+                    const response = await fetch(`/api/images/${filename}`, { method: 'DELETE' });
+                    if (response.ok) {
+                        setStatus('Image deleted');
+                        fetchImages();
+                        setTimeout(() => setStatus(''), 3000);
+                    } else {
+                        const errorData = await response.json();
+                        throw new Error(errorData.detail || 'Delete failed');
+                    }
+                } catch (err) {
+                    setError(err.message || 'Error deleting image');
+                    setTimeout(() => setError(''), 5000);
                 }
             };
 
@@ -841,6 +902,7 @@ async def serve_frontend():
                                 index={index}
                                 isCurrent={index === currentIndex}
                                 onClick={() => displayImage(index)}
+                                onDelete={deleteImage}
                             />
                         ))}
                     </div>
