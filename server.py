@@ -9,7 +9,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 import json
 try:
@@ -166,6 +166,31 @@ def _center_crop_rect(image_size: tuple, aspect: float) -> dict:
             "w": int(cw), "h": int(ch)}
 
 
+# PIL's Image.Transpose constants rotate counterclockwise; we use clockwise
+# rotation as the user-facing convention ("rotate right" = 90° CW), so the
+# mapping is inverted from the obvious naming.
+_ROTATE_MAP = {
+    90:  Image.Transpose.ROTATE_270,   # 90° CW = 270° CCW in PIL terms
+    180: Image.Transpose.ROTATE_180,
+    270: Image.Transpose.ROTATE_90,
+}
+
+
+def _rotated(image: Image.Image, rotation: int) -> Image.Image:
+    rotation = int(rotation) % 360
+    if rotation == 0:
+        return image
+    if rotation not in _ROTATE_MAP:
+        raise ValueError(f"rotation must be one of 0/90/180/270, got {rotation}")
+    return image.transpose(_ROTATE_MAP[rotation])
+
+
+def _stored_rotation(filename: str) -> int:
+    """Crop entries from before rotation support don't have the field; treat as 0."""
+    entry = crops.get(filename) or {}
+    return int(entry.get("rotation", 0)) % 360
+
+
 _face_cascade = None
 def _get_face_cascade():
     global _face_cascade
@@ -178,8 +203,15 @@ def _get_face_cascade():
     return _face_cascade
 
 
-def auto_crop_from_faces(original_path: Path) -> dict:
-    """Pick a crop rect (in original pixels) that frames detected faces nicely.
+_CV_ROTATE_MAP = {
+    90:  "ROTATE_90_CLOCKWISE",
+    180: "ROTATE_180",
+    270: "ROTATE_90_COUNTERCLOCKWISE",
+}
+
+
+def auto_crop_from_faces(original_path: Path, rotation: int = 0) -> dict:
+    """Pick a crop rect (in rotated-image pixels) that frames detected faces.
 
     Falls back to a center crop if face detection finds nothing or errors out.
     """
@@ -191,7 +223,10 @@ def auto_crop_from_faces(original_path: Path) -> dict:
     if img is None:
         # Pillow can sometimes open what cv2 won't; use it for dimensions
         with Image.open(original_path) as pim:
-            return _center_crop_rect(pim.size, aspect)
+            rotated = _rotated(pim, rotation)
+            return _center_crop_rect(rotated.size, aspect)
+    if rotation % 360 != 0:
+        img = cv2.rotate(img, getattr(cv2, _CV_ROTATE_MAP[int(rotation) % 360]))
     h, w = img.shape[:2]
 
     try:
@@ -239,7 +274,13 @@ def auto_crop_from_faces(original_path: Path) -> dict:
 
 
 def _normalize_to_jpeg(image: Image.Image) -> Image.Image:
-    """RGB + downscale to ORIGINAL_MAX_EDGE so kept originals stay manageable."""
+    """Auto-orient via EXIF, force RGB, and downscale to ORIGINAL_MAX_EDGE.
+
+    EXIF orientation is baked in here so the stored original is always
+    right-side-up — any further rotation is then a deliberate user choice,
+    not a fight against phone-camera metadata.
+    """
+    image = ImageOps.exif_transpose(image)
     if image.mode != "RGB":
         image = image.convert("RGB")
     w, h = image.size
@@ -254,23 +295,30 @@ def _normalize_to_jpeg(image: Image.Image) -> Image.Image:
 def apply_crop(filename: str, crop_rect: dict = None) -> Path:
     """Re-cut the displayed JPEG (and its thumbnail) from the stored original.
 
-    If crop_rect is None, uses the saved crop for `filename`, or center-crops
-    if there isn't one.
+    `crop_rect` may include a `rotation` field (0/90/180/270, clockwise);
+    if absent, the previously-stored rotation is reused. The crop x/y/w/h
+    are interpreted in *rotated*-image pixel coordinates.
     """
     original_path = ORIGINALS_DIR / filename
     if not original_path.exists():
         raise FileNotFoundError(f"No original for {filename}")
 
+    if crop_rect is not None and "rotation" in crop_rect:
+        rotation = int(crop_rect["rotation"]) % 360
+    else:
+        rotation = _stored_rotation(filename)
+
     with Image.open(original_path) as src:
         if src.mode != "RGB":
             src = src.convert("RGB")
+        oriented = _rotated(src, rotation)
         aspect = CONFIG["display_size"][0] / CONFIG["display_size"][1]
-        rect = crop_rect or crops.get(filename) or _center_crop_rect(src.size, aspect)
-        rect = _clamp_crop(rect, src.size, aspect)
+        rect = crop_rect or crops.get(filename) or _center_crop_rect(oriented.size, aspect)
+        rect = _clamp_crop(rect, oriented.size, aspect)
 
-        cropped = src.crop((rect["x"], rect["y"],
-                            rect["x"] + rect["w"],
-                            rect["y"] + rect["h"]))
+        cropped = oriented.crop((rect["x"], rect["y"],
+                                 rect["x"] + rect["w"],
+                                 rect["y"] + rect["h"]))
         display_img = cropped.resize(tuple(CONFIG["display_size"]),
                                      Image.Resampling.LANCZOS)
 
@@ -286,7 +334,7 @@ def apply_crop(filename: str, crop_rect: dict = None) -> Path:
     create_thumbnail(display_path)
 
     with crops_lock:
-        crops[filename] = rect
+        crops[filename] = {**rect, "rotation": rotation}
         _save_crops()
     return display_path
 
@@ -621,27 +669,61 @@ async def delete_image(filename: str):
     return {"message": "Image deleted", "filename": filename}
 
 
+def _resolve_rotation(rotation, filename: str) -> int:
+    """Pick the rotation to use for a request: explicit query param if given,
+    otherwise the stored rotation."""
+    if rotation is None:
+        return _stored_rotation(filename)
+    try:
+        r = int(rotation) % 360
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="rotation must be an integer")
+    if r not in (0, 90, 180, 270):
+        raise HTTPException(status_code=400, detail="rotation must be 0/90/180/270")
+    return r
+
+
 @app.get("/api/original/{filename}")
-async def get_original(filename: str):
-    """Serve the stored original (for the re-frame UI)."""
+async def get_original(filename: str, rotation: int = None):
+    """Serve the stored original, optionally rotated. Used by the re-frame UI
+    to preview rotations without persisting."""
     p = ORIGINALS_DIR / filename
     if not p.exists():
         raise HTTPException(status_code=404, detail="Original not found")
-    return FileResponse(p)
+    r = _resolve_rotation(rotation, filename)
+    if r == 0:
+        return FileResponse(p)
+    # Render rotated to a JPEG in memory. Originals are capped at 2000px so
+    # this is fast (~50ms on a Pi 4).
+    with Image.open(p) as src:
+        if src.mode != "RGB":
+            src = src.convert("RGB")
+        out = _rotated(src, r)
+        buf = io.BytesIO()
+        out.save(buf, "JPEG", quality=92)
+    from fastapi.responses import Response
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
 
 
 @app.get("/api/crop/{filename}")
 async def get_crop(filename: str):
-    """Return the current crop rect + the original image dimensions."""
+    """Return the current crop + rotation + the (post-rotation) original dimensions."""
     original_path = ORIGINALS_DIR / filename
     if not original_path.exists():
         raise HTTPException(status_code=404, detail="Original not found")
+    rotation = _stored_rotation(filename)
     with Image.open(original_path) as o:
-        ow, oh = o.size
+        rotated = _rotated(o, rotation)
+        ow, oh = rotated.size
     aspect = CONFIG["display_size"][0] / CONFIG["display_size"][1]
-    rect = crops.get(filename) or _center_crop_rect((ow, oh), aspect)
+    stored = crops.get(filename)
+    if stored:
+        rect = {k: stored[k] for k in ("x", "y", "w", "h")}
+    else:
+        rect = _center_crop_rect((ow, oh), aspect)
     return {
         "crop": rect,
+        "rotation": rotation,
         "original_size": {"w": ow, "h": oh},
         "display_size": list(CONFIG["display_size"]),
     }
@@ -649,14 +731,17 @@ async def get_crop(filename: str):
 
 @app.post("/api/crop/{filename}")
 async def set_crop(filename: str, rect: dict):
-    """Replace the crop for `filename` and re-render the display JPEG.
-    Body: {"x": int, "y": int, "w": int, "h": int} in original-image pixels."""
+    """Replace the crop (and optionally rotation) for `filename` and re-render.
+    Body: {"x": int, "y": int, "w": int, "h": int, "rotation": int?} where x/y/w/h
+    are in *rotated*-image pixel coordinates."""
     original_path = ORIGINALS_DIR / filename
     if not original_path.exists():
         raise HTTPException(status_code=404, detail="Original not found")
     for k in ("x", "y", "w", "h"):
         if k not in rect:
             raise HTTPException(status_code=400, detail=f"Missing field: {k}")
+    if "rotation" in rect and int(rect["rotation"]) % 360 not in (0, 90, 180, 270):
+        raise HTTPException(status_code=400, detail="rotation must be 0/90/180/270")
 
     new_display_path = apply_crop(filename, rect)
 
@@ -669,14 +754,15 @@ async def set_crop(filename: str, rect: dict):
 
 
 @app.post("/api/autocrop/{filename}")
-async def autocrop(filename: str):
-    """Suggest a face-detection crop without persisting. The client decides
-    whether to keep it (POST /api/crop) or discard."""
+async def autocrop(filename: str, rotation: int = None):
+    """Suggest a face-detection crop in the given rotation, without persisting.
+    The client decides whether to keep it (POST /api/crop) or discard."""
     original_path = ORIGINALS_DIR / filename
     if not original_path.exists():
         raise HTTPException(status_code=404, detail="Original not found")
-    rect = auto_crop_from_faces(original_path)
-    return {"crop": rect}
+    r = _resolve_rotation(rotation, filename)
+    rect = auto_crop_from_faces(original_path, r)
+    return {"crop": rect, "rotation": r}
 
 
 @app.get("/api/mock-frame")
@@ -938,6 +1024,12 @@ async def serve_frontend():
         .modal-loading {
             padding: 60px 40px; text-align: center; color: #888;
         }
+        .modal-actions button[title^="Rotate"] {
+            font-size: 18px;
+            line-height: 1;
+            padding: 6px 12px;
+            min-width: 38px;
+        }
     </style>
 </head>
 <body>
@@ -990,7 +1082,9 @@ async def serve_frontend():
             const [crop, setCrop] = useState(null);
             const [origSize, setOrigSize] = useState(null);
             const [dispSize, setDispSize] = useState([800, 480]);
+            const [rotation, setRotation] = useState(0);
             const [scale, setScale] = useState(1);
+            const [imgLoaded, setImgLoaded] = useState(false);
             const [saving, setSaving] = useState(false);
             const [autoframing, setAutoframing] = useState(false);
             const imgRef = useRef(null);
@@ -1005,6 +1099,7 @@ async def serve_frontend():
                         setCrop(data.crop);
                         setOrigSize(data.original_size);
                         setDispSize(data.display_size);
+                        setRotation(data.rotation || 0);
                     })
                     .catch(e => { if (!cancelled) onError('Could not load crop info: ' + e.message); });
                 return () => { cancelled = true; };
@@ -1099,6 +1194,7 @@ async def serve_frontend():
                         body: JSON.stringify({
                             x: Math.round(crop.x), y: Math.round(crop.y),
                             w: Math.round(crop.w), h: Math.round(crop.h),
+                            rotation: rotation,
                         }),
                     });
                     if (!res.ok) throw new Error((await res.json()).detail || 'HTTP ' + res.status);
@@ -1112,7 +1208,8 @@ async def serve_frontend():
             const autoFrame = async () => {
                 setAutoframing(true);
                 try {
-                    const res = await fetch(`/api/autocrop/${filename}`, {method: 'POST'});
+                    const res = await fetch(`/api/autocrop/${filename}?rotation=${rotation}`,
+                                           {method: 'POST'});
                     if (!res.ok) throw new Error((await res.json()).detail || 'HTTP ' + res.status);
                     const data = await res.json();
                     setCrop(clampRect(data.crop.x, data.crop.y, data.crop.w, data.crop.h));
@@ -1123,7 +1220,33 @@ async def serve_frontend():
                 }
             };
 
-            const overlay = (crop && origSize) ? {
+            const rotate = (delta) => {
+                if (!origSize) return;
+                const newRotation = ((rotation + delta) % 360 + 360) % 360;
+                const dimsSwap = (delta % 180) !== 0;
+                const newOrigSize = dimsSwap
+                    ? { w: origSize.h, h: origSize.w }
+                    : { ...origSize };
+                // The old crop rect doesn't survive a 90° spin under the 5:3
+                // aspect lock, so snap back to a centered crop in the new frame.
+                const center = (() => {
+                    const a = dispSize[0] / dispSize[1];
+                    const iw = newOrigSize.w, ih = newOrigSize.h;
+                    let cw, ch;
+                    if (iw / ih > a) { ch = ih; cw = ih * a; }
+                    else             { cw = iw; ch = iw / a; }
+                    return { x: Math.round((iw - cw) / 2), y: Math.round((ih - ch) / 2),
+                             w: Math.round(cw), h: Math.round(ch) };
+                })();
+                setImgLoaded(false);   // hide overlay until the new image renders
+                setRotation(newRotation);
+                setOrigSize(newOrigSize);
+                setCrop(center);
+            };
+
+            // Hide the overlay until the post-rotation image is actually visible —
+            // otherwise the crop rect briefly anchors to the previous frame's pixels.
+            const overlay = (crop && origSize && imgLoaded) ? {
                 position: 'absolute',
                 left: crop.x * scale, top: crop.y * scale,
                 width: crop.w * scale, height: crop.h * scale,
@@ -1141,6 +1264,7 @@ async def serve_frontend():
             };
 
             const loaded = crop && origSize;
+            const busy = autoframing || saving;
 
             return (
                 <div className="modal-overlay" onMouseDown={onBackdropDown}>
@@ -1153,10 +1277,10 @@ async def serve_frontend():
                         {loaded ? (
                             <div className="crop-stage">
                                 <img ref={imgRef}
-                                     src={`/api/original/${filename}`}
+                                     src={`/api/original/${filename}?rotation=${rotation}`}
                                      alt={filename}
                                      className="crop-image"
-                                     onLoad={measure}
+                                     onLoad={() => { setImgLoaded(true); measure(); }}
                                      draggable={false} />
                                 {overlay && (
                                     <div style={overlay} onPointerDown={startDrag('move')}>
@@ -1172,12 +1296,16 @@ async def serve_frontend():
                         )}
                         {loaded && (
                             <div className="modal-actions">
-                                <button onClick={autoFrame} disabled={autoframing}>
+                                <button onClick={() => rotate(-90)} disabled={busy}
+                                        title="Rotate left (counterclockwise)">↺</button>
+                                <button onClick={() => rotate(90)} disabled={busy}
+                                        title="Rotate right (clockwise)">↻</button>
+                                <button onClick={autoFrame} disabled={busy}>
                                     {autoframing ? 'Detecting…' : 'Auto-frame faces'}
                                 </button>
                                 <div style={{flex: 1}} />
                                 <button className="btn-secondary" onClick={onClose}>Cancel</button>
-                                <button onClick={save} disabled={saving}>
+                                <button onClick={save} disabled={busy}>
                                     {saving ? 'Saving…' : 'Save'}
                                 </button>
                             </div>
