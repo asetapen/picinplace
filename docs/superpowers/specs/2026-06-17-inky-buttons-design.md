@@ -56,9 +56,20 @@ auto-cycle timer so the frame doesn't jump again immediately.
   cycle thread (both now write `current_image_index`).
 - E-ink writes stay serialized by the existing `display_lock`.
 
+## Buttons A and B (added)
+
+- **A = play/pause** the slideshow: `_toggle_cycling()` flips `cycling_enabled`
+  (waking the cycle thread to pause promptly, or `start_cycling()` to resume).
+- **B = DO NOT DISTURB** toggle: `_toggle_dnd()` renders an 800x480 bold-red
+  "DO NOT / DISTURB" on white (PIL; font auto-fit with DejaVu → Arial →
+  Pillow-default fallback) and shows it. A `dnd_active` flag makes the cycle
+  thread skip advancing so the screen is held; pressing B again — or C/D —
+  returns to the photos. The rendered screen is written to a temp file, not the
+  photo library.
+- All four buttons are wired via `BUTTON_PINS = {5: "A", 6: "B", 16: "C", 24: "D"}`.
+
 ## Out of scope
 
-- A/B buttons.
 - Web `/api/display/{index}` keeps its current behavior (does not reset the timer);
   only the physical buttons do.
 
