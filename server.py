@@ -69,6 +69,18 @@ current_image_index = 0
 image_files: List[Path] = []
 cycling_enabled = True
 cycle_thread = None
+button_thread = None
+
+# Wakes the cycle thread early so a manual nav (button press) resets the
+# countdown instead of letting it auto-advance right after you navigate.
+cycle_wake = threading.Event()
+# Serializes index update + display between the button thread and cycle thread.
+nav_lock = threading.Lock()
+
+# Inky Impression buttons (BCM pins). Only C and D are wired:
+# C = previous picture, D = next picture.
+BUTTON_DELTAS = {16: -1, 24: +1}
+BUTTON_DEBOUNCE_S = 0.2
 
 # Mock inky module for development / running without hardware (--mock)
 class MockInky:
@@ -438,14 +450,26 @@ def cycle_images():
     Sleep first, then advance and display, so current_image_index always
     names what is currently on the panel (matching what load_existing_images
     already drew at startup, or whatever the user last selected).
+
+    The sleep is an interruptible wait: a manual nav (button press) or a stop
+    request sets cycle_wake, waking us early. A manual nav just restarts the
+    countdown; only a real timeout advances the image.
     """
     global current_image_index
 
     while cycling_enabled:
-        time.sleep(CONFIG["cycle_interval"])
-        if cycling_enabled and image_files:
+        interrupted = cycle_wake.wait(timeout=CONFIG["cycle_interval"])
+        cycle_wake.clear()
+        if not cycling_enabled:
+            break
+        if interrupted:
+            continue  # manual nav reset the timer; don't auto-advance
+        with nav_lock:
+            if not image_files:
+                continue
             current_image_index = (current_image_index + 1) % len(image_files)
-            display_image(image_files[current_image_index])
+            target = image_files[current_image_index]
+        display_image(target)
 
 
 def start_cycling():
@@ -454,6 +478,77 @@ def start_cycling():
     if cycle_thread is None or not cycle_thread.is_alive():
         cycle_thread = threading.Thread(target=cycle_images, daemon=True)
         cycle_thread.start()
+
+
+def _show_relative(delta: int):
+    """Advance the displayed image by `delta` positions (wrapping) and reset the
+    auto-cycle timer. Used by the physical buttons: C = -1 (previous), D = +1 (next).
+    """
+    global current_image_index
+    with nav_lock:
+        if not image_files:
+            return
+        current_image_index = (current_image_index + delta) % len(image_files)
+        cycle_wake.set()  # reset the auto-cycle countdown after a manual nav
+        target = image_files[current_image_index]
+    display_image(target)
+
+
+def _button_listener():
+    """Block on Inky Impression button edges and navigate on C/D presses.
+
+    Uses libgpiod v2 (gpiod + gpiodevice), matching Pimoroni's current Inky
+    examples. Imports are lazy and guarded so dev/--mock and button-less boards
+    are unaffected.
+    """
+    try:
+        import gpiod
+        import gpiodevice
+        from gpiod.line import Bias, Direction, Edge
+    except Exception as e:
+        print(f"Buttons disabled (gpiod unavailable): {e}")
+        return
+
+    try:
+        pins = list(BUTTON_DELTAS)
+        settings = gpiod.LineSettings(
+            direction=Direction.INPUT, bias=Bias.PULL_UP, edge_detection=Edge.FALLING
+        )
+        chip = gpiodevice.find_chip_by_platform()
+        offsets = [chip.line_offset_from_id(pin) for pin in pins]
+        request = chip.request_lines(
+            consumer="picinplace-buttons", config=dict.fromkeys(offsets, settings)
+        )
+    except Exception as e:
+        print(f"Buttons disabled (GPIO setup failed): {e}")
+        return
+
+    offset_to_pin = dict(zip(offsets, pins))
+    last_press: dict = {}
+    print("Inky buttons ready: C = previous picture, D = next picture")
+
+    while True:
+        for event in request.read_edge_events():
+            pin = offset_to_pin.get(event.line_offset)
+            if pin is None:
+                continue
+            now = time.monotonic()
+            if now - last_press.get(pin, 0.0) < BUTTON_DEBOUNCE_S:
+                continue  # debounce: ignore contact bounce / rapid repeats
+            last_press[pin] = now
+            _show_relative(BUTTON_DELTAS[pin])
+
+
+def start_button_listener():
+    """Start the button-reading thread (no-op under --mock or if already running)."""
+    global button_thread
+    if MOCK_DISPLAY:
+        print("Buttons disabled (--mock: no GPIO).")
+        return
+    if button_thread is not None and button_thread.is_alive():
+        return
+    button_thread = threading.Thread(target=_button_listener, daemon=True)
+    button_thread.start()
 
 
 def create_thumbnail(image_path: Path, size=(150, 90)):
@@ -501,6 +596,7 @@ async def startup_event():
     load_existing_images()
     migrate_existing_images()  # backfill originals + crops for pre-existing JPEGs
     start_cycling()
+    start_button_listener()
 
 
 @app.post("/api/upload")
@@ -605,6 +701,7 @@ async def control_cycling(action: str):
         return {"message": "Cycling started"}
     elif action == "stop":
         cycling_enabled = False
+        cycle_wake.set()  # wake the cycle thread so it stops promptly
         return {"message": "Cycling stopped"}
     else:
         raise HTTPException(status_code=400, detail="Invalid action")
