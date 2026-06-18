@@ -52,6 +52,13 @@ THUMB_DIR.mkdir(exist_ok=True)
 CROPS_FILE = UPLOAD_DIR / "crops.json"
 ORIGINAL_MAX_EDGE = 2000  # cap originals so 50 pictures don't fill the SD card
 
+# Vendored JS libs (React/ReactDOM/Babel) served locally so the web UI works
+# when the frame is running as a no-internet access point. Files live in
+# static/ and are committed to the repo.
+STATIC_DIR = Path("static")
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 # In-memory map: display filename -> {"x": int, "y": int, "w": int, "h": int}
 # (crop rect in original-image pixel coordinates). Persisted to crops.json.
 crops: dict = {}
@@ -786,9 +793,9 @@ async def serve_frontend():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>E-ink Picture Frame</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="/static/react.production.min.js"></script>
+    <script src="/static/react-dom.production.min.js"></script>
+    <script src="/static/babel.min.js"></script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;

@@ -197,3 +197,4 @@ cython_debug/
 mock_frame/current_display.jpg
 
 .claude/
+.omc/
