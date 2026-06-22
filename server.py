@@ -787,7 +787,9 @@ async def get_images():
     return {
         "images": [f.name for f in image_files],
         "current_index": current_image_index,
-        "total": len(image_files)
+        "total": len(image_files),
+        "cycling_enabled": cycling_enabled,
+        "dnd_active": dnd_active,
     }
 
 
@@ -1544,6 +1546,7 @@ async def serve_frontend():
             const [currentIndex, setCurrentIndex] = useState(0);
             const [config, setConfig] = useState({});
             const [cycling, setCycling] = useState(true);
+            const [dnd, setDnd] = useState(false);
             const [dragOver, setDragOver] = useState(false);
             const [status, setStatus] = useState('');
             const [error, setError] = useState('');
@@ -1575,6 +1578,8 @@ async def serve_frontend():
                     const response = await fetch('/api/images');
                     const data = await response.json();
                     setImages(data.images);
+                    setCycling(data.cycling_enabled);
+                    setDnd(data.dnd_active);
                     setCurrentIndex(prev => {
                         // Whenever the displayed image changes (cycle thread
                         // advance, or anything else), re-fetch the mock preview.
@@ -1749,6 +1754,7 @@ async def serve_frontend():
                             {cycling ? 'Stop Cycling' : 'Start Cycling'}
                         </button>
                         <span>Cycling: {cycling ? 'ON' : 'OFF'}</span>
+                        {dnd && <span style={{ marginLeft: '16px', color: '#c0392b', fontWeight: 'bold' }}>⛔ DO NOT DISTURB</span>}
                     </div>
 
                     <div className="mock-frame">
