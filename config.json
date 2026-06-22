@@ -1,6 +1,6 @@
 {
-  "max_images": 50,
+  "max_images": 150,
   "cycle_interval": 600,
   "display_size": [800, 480],
-  "saturation": 0
+  "saturation": 0.65
 }
